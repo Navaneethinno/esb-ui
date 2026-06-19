@@ -1,0 +1,14 @@
+/**
+ * ═══════════════════════════════════════════════════════════════
+ * DataTableContainer Styles
+ * ═══════════════════════════════════════════════════════════════
+ * Full-height flex layout to eliminate empty space beneath tables.
+ */
+
+.dt-container {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  height: 100%;
+  min-height: 0;
+}

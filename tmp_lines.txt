@@ -1,0 +1,56 @@
+﻿  async function submitTrigger() {
+    let parsed;
+    try { parsed = JSON.parse(payloadText); }
+    catch { setTriggerStatus({ type: "error", message: "Invalid JSON â€” fix the payload before sending." }); return; }
+    setTriggerStatus({ type: "loading", message: "Sending payloadâ€¦" });
+    const sentAt = Date.now();
+    const srcFmt = selectedAdapter.inboundFormat || selectedAdapter.sourceFormat || "JSON";
+    const tgtFmt = selectedAdapter.outboundFormat
+      || selectedAdapter.raw?.configurations?.[0]?.targetFormat
+      || selectedAdapter.raw?.targetFormat
+      || srcFmt;
+    const conversion = `${srcFmt} âž¡ï¸ ${tgtFmt}`;
+    try {
+      const res = await triggerInboundAdapter(selectedAdapter.id, { payload: parsed });
+      const latency = Date.now() - sentAt;
+      const s = (res?.status ?? "ok").toLowerCase();
+      const isFailed = s === "partial_failure" || s === "failed" || s === "error";
+      if (isFailed) {
+        const reason = res?.error || res?.reason || res?.message || res?.details
+          || res?.outboundResponse?.error || res?.outboundResponse?.message || `Trigger ${res?.status}`;
+        setExecutionResult({
+          adapterName:  selectedAdapter.adapterName || selectedAdapter.id,
+          requestType:  res?.requestType || res?.requestName || selectedAdapter.requestName || "â€”",
+          status:       "Failed",
+          conversion,
+          latency_ms:   res?.latency_ms ?? res?.processingTime ?? (Date.now() - sentAt),
+          errorMessage: reason,
+        });
+        setTriggerStatus({ type: "idle", message: "" });
+      } else {
+        invalidateCache(`adapters:${selectedUser?.username}`);
+        setExecutionResult({
+          adapterName:  selectedAdapter.adapterName || selectedAdapter.id,
+          adapterId:    selectedAdapter.id,
+          requestType:  res?.requestType || res?.matchedRule || res?.requestName
+                        || res?.inbound?.requestName || selectedAdapter.requestName || "â€”",
+          status:       "Success",
+          conversion,
+          latency_ms:   res?.latency_ms ?? res?.processingTime ?? latency,
+          outbound:     res?.outboundResponse?.status || res?.outbound?.status || "â€”",
+          raw:          res,
+        });
+        setTriggerStatus({ type: "success", message: "" });
+      }
+    } catch (e) {
+      setExecutionResult({
+        adapterName:  selectedAdapter.adapterName || selectedAdapter.id,
+        requestType:  selectedAdapter.requestName || "â€”",
+        status:       "Failed",
+        conversion,
+        latency_ms:   Date.now() - sentAt,
+        errorMessage: getApiErrorMessage(e),
+      });
+      setTriggerStatus({ type: "idle", message: "" });
+    }
+  }

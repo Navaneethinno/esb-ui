@@ -1,0 +1,1861 @@
+import { useEffect, useMemo, useState } from "react";
+import {
+  getInboundAdapterConfigurations,
+  getOutboundAdapterConfigurations,
+  listRequestTypes,
+  saveLinkedAdapterMapping,
+  getFees,
+} from "../services/esbApi";
+import { invalidateCachePrefix } from "../utils/apiCache";
+import { useAPI } from "../contexts/APIContext";
+import { safeDisplayValue, safeStringifyMasked } from "../utils/maskSensitive";
+
+// ─── Helpers ────────────────────────────────────────────────────────────────
+const getAdapterId   = (a) => a?.adapterId  || a?.adapter_id  || a?.id  || "";
+const getAdapterName = (a) => a?.adapterName || a?.adapter_name || a?.name || getAdapterId(a);
+const getOutboundId  = (a) => a?.outboundId  || a?.outbound_id  || a?.id  || "";
+const getOutboundName= (a) => a?.name || a?.outboundName || a?.outbound_name || getOutboundId(a);
+const getConfigId    = (c, i = 0) => c?.configId || c?.config_id || c?.id || `config-${i}`;
+const getRequestName = (c, fb = "") => c?.configId || c?.requestName || c?.request_name || c?.requestType || c?.request_type || c?.name || c?.request || fb;
+const ROUTE_FUNCTION_TYPES = ["FEE"];
+const PIPELINE_STEP_TYPES = ["FUNCTION", "CONDITION", "STATIC"];
+const PIPELINE_FUNCTIONS = ["ABS","UPPER","LOWER","TRIM","ROUND","ADD_CONSTANT","SUBTRACT_CONSTANT"];
+const PIPELINE_OPERATORS = [">", ">=", "<", "<=", "==", "!="];
+function createRouteFunction() {
+  return { functionType: "FEE", feeId: "" };
+}
+
+function normalizeRouteFunction(row) {
+  if (!row || typeof row !== "object") return createRouteFunction();
+  return {
+    functionType: row.functionType || row.type || "FEE",
+    feeId: row.feeId || row.fee_id || "",
+  };
+}
+
+function routeFunctionsToPayload(rows) {
+  return rows
+    .filter((row) => String(row.feeId || "").trim())
+    .map((row) => ({
+      functionType: "FEE",
+      feeId: Number(row.feeId) || row.feeId,
+    }));
+}
+
+const REQUEST_SCHEMA_KEYS  = ["requestSchema","request_schema","requestPayload","request_payload","inputSchema","input_schema","inputPayload","input_payload"];
+const RESPONSE_SCHEMA_KEYS = ["responseSchema","response_schema","responsePayload","response_payload","outputSchema","output_schema","outputPayload","output_payload"];
+const SUPPORTED_FUNCTIONS  = ["UPPERCASE","LOWERCASE","TRIM","ADD_CONSTANT","MULTIPLY","ABS","UUID"];
+const PARAMETER_FUNCTIONS  = new Set(["ADD_CONSTANT","MULTIPLY"]);
+
+function parseMaybeJson(value) {
+  if (typeof value !== "string") return value;
+  try { return JSON.parse(value); } catch { return value; }
+}
+
+function stringValue(value) {
+  if (value == null) return "";
+  if (typeof value === "string") return value.trim();
+  if (typeof value === "object") {
+    return String(
+      value.targetField ||
+      value.fieldName ||
+      value.name ||
+      value.displayName ||
+      value.value ||
+      value.id ||
+      value.code ||
+      "",
+    ).trim();
+  }
+  return String(value).trim();
+}
+
+function normalizeMappingRow(row) {
+  const mappingType = String(row?.mappingType || "DIRECT").toUpperCase();
+  const legacyFunctionSteps = mappingType === "FUNCTION" ? [{
+    type: "FUNCTION",
+    function: row?.functionName || "ABS",
+    parameter: row?.functionParameter || "",
+  }] : [];
+  const pipeline = Array.isArray(row?.pipeline) ? row.pipeline : legacyFunctionSteps;
+  return {
+    ...row,
+    sourceField: stringValue(row?.sourceField),
+    targetField: stringValue(row?.targetField),
+    mappingType,
+    pipeline: pipeline.map(normalizePipelineStep),
+    decisionRules: Array.isArray(row?.decisionRules) ? row.decisionRules.map(normalizeDecisionRule) : [],
+    defaultResult: row?.defaultResult ?? "",
+    staticValue: row?.staticValue ?? "",
+    feeId: row?.feeId ?? "",
+    applyFeeAs: row?.applyFeeAs ?? "OVERWRITE",
+    newField: row?.newField ?? "",
+  };
+}
+
+function getPath(source, keys) {
+  if (!source) return {};
+  for (const key of keys) {
+    for (const root of [source, source?.metadata, source?.contract, source?.payloadContract]) {
+      if (root?.[key] !== undefined && root[key] !== null && root[key] !== "")
+        return parseMaybeJson(root[key]);
+    }
+  }
+  return {};
+}
+
+// Recursively flatten nested object schemas into flat paths (e.g., data[].account_no)
+function flattenSchema(obj, prefix = "", excludeParents = true) {
+  const fields = [];
+  if (!obj || typeof obj !== "object") return fields;
+  
+  for (const key of Object.keys(obj)) {
+    const value = obj[key];
+    const currentPath = prefix ? `${prefix}.${key}` : key;
+    
+    // Check if this is an array of objects
+    if (Array.isArray(value) && value.length > 0 && typeof value[0] === "object") {
+      // Flatten array children with [] notation
+      const arrayPrefix = `${currentPath}[]`;
+      const childFields = flattenSchema(value[0], arrayPrefix, excludeParents);
+      fields.push(...childFields);
+      // Don't include the parent array itself if excludeParents is true
+    } else if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+      // Check if it has type property (leaf node)
+      const hasType = "type" in value || "format" in value;
+      if (hasType) {
+        fields.push({ name: currentPath, type: value.type || "", required: false });
+      } else {
+        // Recurse into nested object
+        const childFields = flattenSchema(value, currentPath, excludeParents);
+        if (childFields.length > 0) {
+          // Only add children, not the parent object itself
+          fields.push(...childFields);
+        } else if (!excludeParents) {
+          // If no children and not excluding parents, add the parent
+          fields.push({ name: currentPath, type: "object", required: false });
+        }
+      }
+    } else {
+      // Primitive value
+      fields.push({ name: currentPath, type: typeof value, required: false });
+    }
+  }
+  return fields;
+}
+
+function extractFields(schema) {
+  const parsed = typeof schema === "string" ? parseMaybeJson(schema) : schema;
+  if (!parsed || typeof parsed !== "object") return [];
+  const protocolList = parsed.protocolFields || parsed.protocolMetadata?.fields || parsed.protocolMetadata?.requestFields || parsed.protocolMetadata?.responseFields || parsed.protocolConfig?.fields || parsed.protocolConfig?.requestFields || parsed.protocolConfig?.responseFields || parsed.fields || parsed.dataElements || parsed.nodes || null;
+  if (Array.isArray(protocolList)) {
+    return protocolList.map((item) => ({
+      name: String(item.path || item.number || item.de || item.key || item.code || item.name || item.displayName || "").trim(),
+      type: String(item.type || item.format || item.valueType || "").trim(),
+      required: Boolean(item.required),
+      meta: item,
+    })).filter(item => item.name);
+  }
+  if (parsed.properties) {
+    return Object.keys(parsed.properties).map(name => ({
+      name, type: parsed.properties[name]?.type || "",
+      required: Array.isArray(parsed.required) && parsed.required.includes(name),
+    }));
+  }
+  
+  // Try flattening the schema to handle nested structures (exclude parent nodes)
+  const flattened = flattenSchema(parsed, "", true);
+  if (flattened.length > 0) return flattened;
+  
+  const exclude = ["type","properties","required","items","additionalProperties","description","$schema","definitions","title"];
+  const keys = Object.keys(parsed).filter(k => !exclude.includes(k));
+  return keys.map(name => ({ name, type: "", required: false }));
+}
+
+function extractProtocolFieldsFromConfig(config, direction) {
+  const root = config || {};
+  const buckets = [
+    root.protocolMetadata,
+    root.protocolConfig,
+    root.iso8583Config,
+    root.iso20022Config,
+    root.metadata,
+  ].filter(Boolean);
+
+  for (const bucket of buckets) {
+    const candidates = [
+      bucket?.[`${direction}Fields`],
+      bucket?.fields,
+      bucket?.supportedFields,
+      bucket?.dataElements,
+      bucket?.nodes,
+    ];
+    for (const list of candidates) {
+      if (Array.isArray(list) && list.length > 0) {
+        return extractFields({ fields: list });
+      }
+    }
+  }
+
+  return [];
+}
+
+function isStrictProtocolFormat(config) {
+  const hint = String(config?.sourceFormat || config?.targetFormat || config?.format || config?.protocolFormat || "").toUpperCase();
+  return hint === "ISO8583" || hint === "ISO20022";
+}
+
+function emptyRow(targetField = "", sourceField = "") {
+  return {
+    sourceField,
+    targetField,
+    mappingType: "DIRECT",
+    staticValue: "",
+    pipeline: [],
+    decisionRules: [],
+    defaultResult: "",
+    feeId: "",
+    applyFeeAs: "OVERWRITE",
+    newField: "",
+  };
+}
+
+function isFunctionReady(fn, param) {
+  if (!fn) return false;
+  return PARAMETER_FUNCTIONS.has(fn) ? String(param ?? "").trim() !== "" : true;
+}
+
+function formatFn(fn, param) {
+  if (!fn) return "";
+  return PARAMETER_FUNCTIONS.has(fn) ? `${fn}(${param || "?"})` : `${fn}()`;
+}
+
+function buildMappingObject(rows) {
+  return rows.reduce((acc, row) => {
+    const cleanRow = normalizeMappingRow(row);
+    const sourceField = cleanRow.sourceField;
+    const targetField = cleanRow.targetField;
+    if (!sourceField && !targetField) return acc;
+    const type = cleanRow.mappingType || "DIRECT";
+    if (type === "STATIC")    { acc[sourceField || targetField || `static-${Object.keys(acc).length}`] = { mappingType: "STATIC", sourceField, targetField, staticValue: cleanRow.staticValue || "" }; return acc; }
+    if (type === "FUNCTION" || type === "TRANSFORMATION")  { 
+      acc[sourceField || targetField || `function-${Object.keys(acc).length}`] = { 
+        mappingType: "TRANSFORMATION", 
+        sourceField,
+        targetField,
+        pipeline: (cleanRow.pipeline || []).map(normalizePipelineStep),
+      }; 
+      return acc; 
+    }
+    if (type === "CONDITION" || type === "DECISION") {
+      acc[sourceField || targetField || `condition-${Object.keys(acc).length}`] = {
+        sourceField,
+        targetField,
+        mappingType: "DECISION",
+        decisionRules: (cleanRow.decisionRules || []).map((rule) => ({
+          operator: rule?.operator || ">",
+          compareValue: rule?.compareValue ?? rule?.value ?? "",
+          value: rule?.compareValue ?? rule?.value ?? "",
+          result: rule?.result ?? "",
+        })),
+        defaultResult: cleanRow.defaultResult || "",
+      };
+      return acc;
+    }
+    if (type === "FEE") { acc[sourceField || targetField || `fee-${Object.keys(acc).length}`] = { sourceField, targetField, mappingType: "FEE", feeId: cleanRow.feeId || "", feeMode: cleanRow.applyFeeAs || "OVERWRITE", applyFeeAs: cleanRow.applyFeeAs || "OVERWRITE", newField: cleanRow.newField || "" }; return acc; }
+    if (sourceField || targetField) acc[sourceField || targetField || `direct-${Object.keys(acc).length}`] = { sourceField, targetField, mappingType: type };
+    return acc;
+  }, {});
+}
+
+function mappingObjectToRows(obj) {
+  if (!obj || typeof obj !== "object") return [];
+  return Object.entries(obj).map(([sourceFieldKey, val]) => {
+    if (typeof val === "string") return emptyRow(stringValue(val), stringValue(sourceFieldKey));
+    if (typeof val === "object" && val !== null) {
+      const type = val.mappingType || "DIRECT";
+      const resolvedSource = stringValue(val.sourceField) || stringValue(sourceFieldKey);
+      const resolvedTarget = stringValue(val.targetField) || stringValue(sourceFieldKey);
+      return { ...emptyRow(resolvedTarget, resolvedSource), mappingType: type, staticValue: val.staticValue || "", pipeline: Array.isArray(val.pipeline) ? val.pipeline.map(normalizePipelineStep) : [], decisionRules: Array.isArray(val.decisionRules) ? val.decisionRules.map((rule) => normalizeDecisionRule({ ...rule, value: rule?.compareValue ?? rule?.value ?? "" })) : [], defaultResult: val.defaultResult || "", feeId: val.feeId || "", applyFeeAs: val.feeMode || val.applyFeeAs || "OVERWRITE", newField: val.newField || "" };
+    }
+    return emptyRow("", stringValue(sourceFieldKey));
+  });
+}
+
+function matchScore(a, b) {
+  const na = String(a||"").toLowerCase().replace(/[^a-z0-9]/g,"");
+  const nb = String(b||"").toLowerCase().replace(/[^a-z0-9]/g,"");
+  if (!na||!nb) return 0;
+  if (na===nb) return 1;
+  if (na.includes(nb)||nb.includes(na)) return 0.82;
+  const pa = a.toLowerCase().split(/[_\s.-]+|(?=[A-Z])/).filter(Boolean);
+  const pb = b.toLowerCase().split(/[_\s.-]+|(?=[A-Z])/).filter(Boolean);
+  const shared = pa.filter(p => pb.includes(p)).length;
+  if (shared > 0) return 0.7 + shared / Math.max(pa.length, pb.length, 1) / 5;
+  let pref = 0;
+  for (let i = 0; i < Math.min(na.length, nb.length); i++) { if (na[i]!==nb[i]) break; pref++; }
+  return pref / Math.max(na.length, nb.length);
+}
+
+function suggestMappings(sourceFields, targetFields, currentRows) {
+  const usedSrc = new Set(currentRows.map(r => r.sourceField).filter(Boolean));
+  const usedTgt = new Set(currentRows.map(r => r.targetField).filter(Boolean));
+  const suggestions = [];
+  targetFields.forEach(tgt => {
+    if (usedTgt.has(tgt.name)) return;
+    let best = null, bestScore = 0.62;
+    sourceFields.forEach(src => {
+      if (usedSrc.has(src.name)) return;
+      const s = matchScore(src.name, tgt.name);
+      if (s > bestScore) { best = src; bestScore = s; }
+    });
+    if (best) { usedSrc.add(best.name); suggestions.push({ sourceField: best.name, targetField: tgt.name }); }
+  });
+  return suggestions;
+}
+
+function applyFunction(fn, val, param) {
+  switch (fn) {
+    case "UPPERCASE": return String(val||"").toUpperCase();
+    case "LOWERCASE": return String(val||"").toLowerCase();
+    case "TRIM": return String(val||"").trim();
+    case "ABS": return Math.abs(Number(val)||0);
+    case "ADD_CONSTANT": return (Number(val)||0) + (Number(param)||0);
+    case "MULTIPLY": return (Number(val)||0) * (Number(param)||0);
+    case "UUID": return crypto.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    default: return val;
+  }
+}
+
+function applyCondition(val, op, cv, tv, fv) {
+  const sn = Number(val), cn = Number(cv), num = !isNaN(sn) && !isNaN(cn);
+  const result = op==="==" ? (num?sn===cn:val==cv) : op==="!=" ? (num?sn!==cn:val!=cv) : op===">" ? (num?sn>cn:val>cv) : op==="<" ? (num?sn<cn:val<cv) : op===">=" ? (num?sn>=cn:val>=cv) : op==="<=" ? (num?sn<=cn:val<=cv) : false;
+  return result ? tv : fv;
+}
+
+function normalizeDecisionRule(rule = {}) {
+  return {
+    operator: PIPELINE_OPERATORS.includes(String(rule?.operator || ">")) ? String(rule?.operator || ">") : ">",
+    value: rule?.value ?? "",
+    result: rule?.result ?? "",
+  };
+}
+
+function normalizePipelineStep(step = {}) {
+  const type = String(step?.type || "FUNCTION").toUpperCase();
+  if (type === "STATIC") return { type: "STATIC", value: step?.value ?? "" };
+  if (type === "CONDITION") {
+    return {
+      type: "CONDITION",
+      operator: PIPELINE_OPERATORS.includes(String(step?.operator || ">")) ? String(step?.operator || ">") : ">",
+      value: step?.value ?? step?.conditionValue ?? "",
+      result: step?.result ?? step?.trueValue ?? "",
+      falseResult: step?.falseResult ?? step?.falseValue ?? "",
+    };
+  }
+  return {
+    type: type === "FUNCTION" ? "FUNCTION" : "FUNCTION",
+    function: PIPELINE_FUNCTIONS.includes(String(step?.function || step?.functionName || "ABS"))
+      ? String(step?.function || step?.functionName || "ABS")
+      : "ABS",
+    parameter: step?.parameter ?? step?.functionParameter ?? "",
+  };
+}
+
+function renderPipelineLabel(step) {
+  if (!step) return "";
+  const normalized = normalizePipelineStep(step);
+  if (normalized.type === "STATIC") return `STATIC(${normalized.value || "value"})`;
+  if (normalized.type === "CONDITION") return `DECISION ${normalized.operator} ${normalized.value || "?"}`;
+  if (["ADD_CONSTANT", "SUBTRACT_CONSTANT"].includes(normalized.function)) return `${normalized.function}(${normalized.parameter || "?"})`;
+  return normalized.function;
+}
+
+// ─── Mapping Type Modal ────────────────────────────────────────────────────
+function MappingTypeModal({ sourceField, targetField, existingRow, onSelect, onCancel, targetFields = [], fees = [] }) {
+  const [type, setType] = useState(String(existingRow?.mappingType || "DIRECT").toUpperCase());
+  const [tgt, setTgt] = useState(targetField || existingRow?.targetField || "");
+  const [sv, setSv] = useState(existingRow?.staticValue || "");
+  const [pipeline, setPipeline] = useState(Array.isArray(existingRow?.pipeline) ? existingRow.pipeline.map(normalizePipelineStep) : []);
+  const [decisionRules, setDecisionRules] = useState(Array.isArray(existingRow?.decisionRules) ? existingRow.decisionRules.map(normalizeDecisionRule) : []);
+  const [defaultResult, setDefaultResult] = useState(existingRow?.defaultResult || "");
+  const [feeId, setFeeId] = useState(existingRow?.feeId || "");
+  const [applyFeeAs, setApplyFeeAs] = useState(existingRow?.applyFeeAs || "OVERWRITE");
+  const [newField, setNewField] = useState(existingRow?.newField || "");
+  const selectedFee = useMemo(() => fees.find((fee) => String(fee.feeId ?? fee.id ?? "") === String(feeId || "")), [fees, feeId]);
+
+  const types = [
+    { id: "DIRECT", label: "Direct", icon: "ti-arrow-right", desc: "Map source to target", color: "#16a34a" },
+    { id: "STATIC", label: "Static", icon: "ti-lock", desc: "Write a constant value", color: "#2563eb" },
+    { id: "TRANSFORMATION", label: "Transformation", icon: "ti-scan", desc: "Chain multiple transforms", color: "#7c3aed" },
+    { id: "DECISION", label: "Decision", icon: "ti-git-branch", desc: "Evaluate rule table", color: "#f59e0b" },
+    { id: "FEE", label: "Fee", icon: "ti-currency-dollar", desc: "Apply route fee", color: "#0ea5e9" },
+  ];
+
+  const addPipelineStep = () => setPipeline(prev => [...prev, { type: "FUNCTION", function: "ABS", parameter: "" }]);
+  const updatePipelineStep = (index, patch) => setPipeline(prev => prev.map((step, i) => i === index ? normalizePipelineStep({ ...step, ...patch }) : step));
+  const movePipelineStep = (index, direction) => setPipeline(prev => {
+    const next = [...prev];
+    const targetIndex = index + direction;
+    if (targetIndex < 0 || targetIndex >= next.length) return next;
+    [next[index], next[targetIndex]] = [next[targetIndex], next[index]];
+    return next;
+  });
+  const addRule = () => setDecisionRules(prev => [...prev, { operator: ">", value: "", result: "" }]);
+  const updateRule = (index, patch) => setDecisionRules(prev => prev.map((rule, i) => i === index ? normalizeDecisionRule({ ...rule, ...patch }) : rule));
+  const moveRule = (index, direction) => setDecisionRules(prev => {
+    const next = [...prev];
+    const targetIndex = index + direction;
+    if (targetIndex < 0 || targetIndex >= next.length) return next;
+    [next[index], next[targetIndex]] = [next[targetIndex], next[index]];
+    return next;
+  });
+
+  const canConfirm = Boolean(tgt.trim()) && (
+    type === "DIRECT" ||
+    (type === "STATIC" && sv.trim()) ||
+    (type === "TRANSFORMATION" && pipeline.length > 0) ||
+    (type === "DECISION" && decisionRules.length > 0) ||
+    (type === "FEE" && feeId)
+  );
+
+  const handleConfirm = () => {
+    const target = tgt.trim();
+    if (!target) return;
+    const base = { targetField: target, mappingType: type };
+    if (type === "DIRECT") onSelect({ ...base, sourceField: sourceField || "" });
+    if (type === "STATIC") onSelect({ ...base, sourceField: "", staticValue: sv });
+    if (type === "TRANSFORMATION") onSelect({ ...base, sourceField: sourceField || "", pipeline });
+    if (type === "DECISION") onSelect({ ...base, sourceField: sourceField || "", decisionRules, defaultResult });
+    if (type === "FEE") onSelect({ ...base, sourceField: sourceField || "", feeId, applyFeeAs, newField });
+  };
+
+  const pipelinePreview = useMemo(() => {
+    if (type === "TRANSFORMATION") return pipeline.map(renderPipelineLabel).filter(Boolean);
+    if (type === "DECISION") return decisionRules.map((rule) => `${rule.operator} ${rule.value || "?"} => ${rule.result || "?"}`);
+    if (type === "FEE") return selectedFee ? [`FEE ${selectedFee.feeName || selectedFee.name || "Selected Fee"}`, `Mode: ${applyFeeAs === "NEW_FIELD" ? "Create New Field" : "Overwrite Existing Field"}`] : ["Select a fee to continue"];
+    if (type === "STATIC") return [`STATIC ${sv || "value"}`];
+    return sourceField ? [sourceField, "DIRECT", tgt || "Target"] : ["Select a source field", "DIRECT", tgt || "Target"];
+  }, [applyFeeAs, decisionRules, feeId, pipeline, selectedFee, sourceField, sv, tgt, type]);
+
+  return (
+    <div className="modal-backdrop" onClick={e => e.target === e.currentTarget && onCancel()}>
+      <div className="la-modal" style={{ width: "min(960px, 96vw)" }}>
+        <div className="la-modal-header">
+          <div>
+            <p className="la-modal-eyebrow"><i className="ti ti-arrows-exchange" /> Create Mapping</p>
+            <h2 className="la-modal-title">
+              {sourceField ? <><span className="la-token la-token--src">{sourceField}</span> <i className="ti ti-arrow-right" style={{ fontSize: 14, color: "var(--muted)" }} /> </> : null}
+              <span className="la-token la-token--tgt">{tgt || "Target Field"}</span>
+            </h2>
+          </div>
+          <button type="button" className="ar-icon-btn" style={{ opacity: 1 }} onClick={onCancel}><i className="ti ti-x" /></button>
+        </div>
+
+        <div className="la-modal-body" style={{ display: "grid", gap: 16 }}>
+          <div style={{ border: "1px solid var(--border)", borderRadius: 14, padding: 14, background: "linear-gradient(180deg, rgba(22,163,74,0.08), rgba(255,255,255,0.02))" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", marginBottom: 10 }}>
+              <strong style={{ fontSize: 13, color: "var(--heading)" }}>Pipeline Flow</strong>
+              <span style={{ fontSize: 11, color: "var(--muted)" }}>Source Field → Pipeline Steps → Target Field</span>
+            </div>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center" }}>
+              <span className="la-flow-pill la-flow-pill--direct">{sourceField || "Source Field"}</span>
+              <i className="ti ti-arrow-down" style={{ color: "var(--muted)" }} />
+              {pipelinePreview.map((item, index) => (
+                <span key={`${item}-${index}`} className={type === "FEE" ? "la-flow-pill la-flow-pill--fn" : "la-flow-pill la-flow-pill--static"}>{item}</span>
+              ))}
+              <i className="ti ti-arrow-down" style={{ color: "var(--muted)" }} />
+              <span className="la-flow-pill la-flow-pill--target">{tgt || "Target Field"}</span>
+            </div>
+          </div>
+
+          <div className="field">
+            <label>Target Field</label>
+            <select value={tgt} onChange={e => setTgt(e.target.value)} autoFocus>
+              <option value="">-- Select target field --</option>
+              {targetFields.map(f => <option key={f.name} value={f.name}>{f.name}</option>)}
+            </select>
+          </div>
+
+          <div className="la-type-grid">
+            {types.map(t => (
+              <button key={t.id} type="button" className={`la-type-btn${type === t.id ? " la-type-btn--active" : ""}`} style={{ "--t-color": t.color }} onClick={() => setType(t.id)}>
+                <i className={`ti ${t.icon}`} />
+                <strong>{t.label}</strong>
+                <span>{t.desc}</span>
+              </button>
+            ))}
+          </div>
+
+          {type === "STATIC" && (
+            <div className="field">
+              <label>Static Value</label>
+              <input value={sv} onChange={e => setSv(e.target.value)} placeholder="e.g. CREDIT" />
+            </div>
+          )}
+
+          {type === "TRANSFORMATION" && (
+            <div style={{ display: "grid", gap: 12 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <strong style={{ fontSize: 13 }}>Transformation Steps</strong>
+                <button type="button" className="btn-ghost" onClick={addPipelineStep}><i className="ti ti-plus" /> Add Step</button>
+              </div>
+              {pipeline.length === 0 && <div style={{ color: "var(--muted)", fontSize: 12 }}>Add one or more transformations.</div>}
+              {pipeline.map((step, index) => {
+                const normalized = normalizePipelineStep(step);
+                return (
+                  <div key={index} style={{ border: "1px solid var(--border)", borderRadius: 10, padding: 12, background: "var(--panel-soft)", display: "grid", gap: 10 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                      <strong style={{ fontSize: 12 }}>Step {index + 1}</strong>
+                      <div style={{ display: "flex", gap: 6 }}>
+                        <button type="button" className="btn-ghost" onClick={() => movePipelineStep(index, -1)} disabled={index === 0}>Up</button>
+                        <button type="button" className="btn-ghost" onClick={() => movePipelineStep(index, 1)} disabled={index === pipeline.length - 1}>Down</button>
+                        <button type="button" className="btn-ghost" onClick={() => setPipeline(prev => prev.filter((_, i) => i !== index))}>Remove</button>
+                      </div>
+                    </div>
+                    <div className="field">
+                      <label>Transformation</label>
+                      <select value={normalized.function} onChange={e => updatePipelineStep(index, { type: "FUNCTION", function: e.target.value })}>
+                        {PIPELINE_FUNCTIONS.map(fn => <option key={fn} value={fn}>{fn}</option>)}
+                      </select>
+                    </div>
+                    {["ADD_CONSTANT","SUBTRACT_CONSTANT"].includes(normalized.function) && (
+                      <div className="field">
+                        <label>Parameter</label>
+                        <input value={normalized.parameter || ""} onChange={e => updatePipelineStep(index, { parameter: e.target.value })} placeholder="e.g. 10" />
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {type === "DECISION" && (
+            <div style={{ display: "grid", gap: 12 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <strong style={{ fontSize: 13 }}>Decision Rules</strong>
+                <button type="button" className="btn-ghost" onClick={addRule}><i className="ti ti-plus" /> Add Rule</button>
+              </div>
+              {decisionRules.length === 0 && <div style={{ color: "var(--muted)", fontSize: 12 }}>Top to bottom. First matching rule wins.</div>}
+              <div style={{ display: "grid", gridTemplateColumns: "120px 1fr 1fr auto", gap: 8, fontSize: 11, fontWeight: 700, color: "var(--muted)" }}>
+                <div>Operator</div>
+                <div>Value</div>
+                <div>Result</div>
+                <div />
+              </div>
+              {decisionRules.map((rule, index) => (
+                <div key={index} style={{ display: "grid", gridTemplateColumns: "120px 1fr 1fr auto", gap: 8, alignItems: "center" }}>
+                  <select value={rule.operator || ">"} onChange={e => updateRule(index, { operator: e.target.value })}>
+                    {PIPELINE_OPERATORS.map((op) => <option key={op} value={op}>{op}</option>)}
+                  </select>
+                  <input value={rule.value || ""} onChange={e => updateRule(index, { value: e.target.value })} placeholder="500" />
+                  <input value={rule.result || ""} onChange={e => updateRule(index, { result: e.target.value })} placeholder="CREDIT" />
+                  <div style={{ display: "flex", gap: 6 }}>
+                    <button type="button" className="btn-ghost" onClick={() => moveRule(index, -1)} disabled={index === 0}>Up</button>
+                    <button type="button" className="btn-ghost" onClick={() => moveRule(index, 1)} disabled={index === decisionRules.length - 1}>Down</button>
+                  </div>
+                </div>
+              ))}
+              <div className="field">
+                <label>Default Result</label>
+                <input value={defaultResult} onChange={e => setDefaultResult(e.target.value)} placeholder="NORMAL" />
+              </div>
+            </div>
+          )}
+
+          {type === "FEE" && (
+            <div style={{ display: "grid", gap: 12 }}>
+              <div className="field">
+                <label>Fee</label>
+                <select value={feeId} onChange={e => setFeeId(e.target.value)}>
+                  <option value="">-- Select fee --</option>
+                  {fees.map(fee => {
+                    const feeName = fee.feeName || fee.name || fee.fee_name || `Fee ${fee.feeId || fee.id}`;
+                    const feeCode = fee.feeCode || fee.code || fee.fee_code || "";
+                    const feeOwner = fee.createdByUser || fee.created_by_user || fee.username || "";
+                    return <option key={fee.feeId || fee.id || feeCode} value={fee.feeId || fee.id}>{feeName}{feeCode ? ` (${feeCode})` : ""}{feeOwner ? ` • ${feeOwner}` : ""}</option>;
+                  })}
+                </select>
+              </div>
+              {selectedFee && (
+                <div style={{ border: "1px solid var(--border)", borderRadius: 10, padding: 12, background: "var(--panel-soft)", display: "grid", gap: 4, fontSize: 12, color: "var(--muted)" }}>
+                  <strong style={{ color: "var(--heading)" }}>{selectedFee.feeName || selectedFee.name || "Selected Fee"}</strong>
+                  <span>Fee ID: {selectedFee.feeId || selectedFee.id}</span>
+                  <span>Created By: {selectedFee.createdByUser || selectedFee.created_by_user || selectedFee.username || "Unknown"}</span>
+                </div>
+              )}
+              <div className="field">
+                <label>Apply Result As</label>
+                <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
+                  <label><input type="radio" checked={applyFeeAs === "OVERWRITE"} onChange={() => setApplyFeeAs("OVERWRITE")} /> Overwrite Existing Field</label>
+                  <label><input type="radio" checked={applyFeeAs === "NEW_FIELD"} onChange={() => setApplyFeeAs("NEW_FIELD")} /> Create New Field</label>
+                </div>
+              </div>
+              {applyFeeAs === "NEW_FIELD" && (
+                <div className="field">
+                  <label>Field</label>
+                  <select value={newField} onChange={e => setNewField(e.target.value)}>
+                    <option value="">-- Select field --</option>
+                    {targetFields.map(f => <option key={f.name} value={f.name}>{f.name}</option>)}
+                  </select>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+
+        <div className="la-modal-footer">
+          <button type="button" className="btn-ghost" onClick={onCancel}>Cancel</button>
+          <button type="button" className="btn-primary" onClick={handleConfirm} disabled={!canConfirm}>
+            <i className="ti ti-check" /> Apply Mapping
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}// ─── Mapping Row (FIX 1: Enhanced FUNCTION visualization) ────────────────────
+function MappingRow({ row, onRemove, onEdit }) {
+  const type = row.mappingType || "DIRECT";
+
+  // FIX 1: FUNCTION mappings now show source → [FUNCTION] → target
+  if (type === "FUNCTION" || (Array.isArray(row.pipeline) && row.pipeline.length > 0)) {
+    const steps = Array.isArray(row.pipeline) && row.pipeline.length > 0
+      ? row.pipeline.map(renderPipelineLabel)
+      : [formatFn(row.functionName, safeDisplayValue(row.functionParameter))].filter(Boolean);
+    return (
+      <div className="la-mapping-row la-mapping-row--function" data-type="function">
+        <div className="la-mapping-row-inner">
+          <span className="la-flow-pill la-flow-pill--direct">{safeDisplayValue(row.sourceField) || <em style={{ opacity: 0.5 }}>no source</em>}</span>
+          {steps.map((step, index) => (
+            <span key={`${step}-${index}`}>
+              <i className="ti ti-arrow-right la-flow-arrow" style={{ fontSize: 11 }} />
+              <span className="la-flow-pill la-flow-pill--fn">{step}</span>
+            </span>
+          ))}
+          <i className="ti ti-arrow-right la-flow-arrow" style={{ fontSize: 11 }} />
+          <span className="la-flow-pill la-flow-pill--target">{safeDisplayValue(row.targetField)}</span>
+        </div>
+        <div className="la-mapping-row-actions">
+          <button type="button" className="ar-icon-btn" style={{ opacity: 1 }} onClick={onEdit} title="Edit"><i className="ti ti-pencil" /></button>
+          <button type="button" className="ar-icon-btn ar-icon-btn-danger" style={{ opacity: 1 }} onClick={onRemove} title="Remove"><i className="ti ti-trash" /></button>
+        </div>
+      </div>
+    );
+  }
+
+  const label = (() => {
+    if (type === "STATIC")    return <><span className="la-flow-pill la-flow-pill--static">"{safeDisplayValue(row.staticValue)}"</span></>; 
+    if (type === "CONDITION") {
+      const summary = Array.isArray(row.decisionRules) && row.decisionRules.length > 0
+        ? row.decisionRules.map((rule) => `${rule.operator || ">"} ${safeDisplayValue(rule.value)} -> ${safeDisplayValue(rule.result)}`).join(" | ")
+        : `${safeDisplayValue(row.sourceField)||"field"} ${row.operator} ${safeDisplayValue(row.conditionValue)} ? ${safeDisplayValue(row.trueValue)} : ${safeDisplayValue(row.falseValue)}`;
+      return <span className="la-flow-pill la-flow-pill--cond">{summary}</span>;
+    }
+    if (type === "FEE") return <span className="la-flow-pill la-flow-pill--fn">FEE {safeDisplayValue(row.feeId)}{row.applyFeeAs === "NEW_FIELD" ? ` → ${safeDisplayValue(row.newField)}` : " → existing field"}</span>;
+    return <span className="la-flow-pill la-flow-pill--direct">{safeDisplayValue(row.sourceField)||<em style={{ opacity: 0.5 }}>no source</em>}</span>;
+  })();
+
+  return (
+    <div className="la-mapping-row" data-type={type.toLowerCase()}>
+      <div className="la-mapping-row-inner">
+        {label}
+        <i className="ti ti-arrow-right la-flow-arrow" />
+        <span className="la-flow-pill la-flow-pill--target">{safeDisplayValue(row.targetField)}</span>
+      </div>
+      <div className="la-mapping-row-actions">
+        <button type="button" className="ar-icon-btn" style={{ opacity: 1 }} onClick={onEdit} title="Edit"><i className="ti ti-pencil" /></button>
+        <button type="button" className="ar-icon-btn ar-icon-btn-danger" style={{ opacity: 1 }} onClick={onRemove} title="Remove"><i className="ti ti-trash" /></button>
+      </div>
+    </div>
+  );
+}
+
+// ─── Field Pill ───────────────────────────────────────────────────────────────
+function FieldPill({ field, state, isSelected, onClick }) {
+  return (
+    <button 
+      type="button" 
+      className={`la-field-pill la-field-pill--${state}${isSelected ? " la-field-pill--selected" : ""}`} 
+      onClick={onClick}
+      title={field.name}
+    >
+      <span className="la-field-dot" />
+      <span className="la-field-name">{field.name}</span>
+      {field.required && <span className="la-field-req">*</span>}
+    </button>
+  );
+}
+
+// ─── Mapping Studio ───────────────────────────────────────────────────────────
+function MappingStudio({ sourceLabel, targetLabel, sourceAdapterName, targetAdapterName, sourceFields, targetFields, rows, setRows, isStrictProtocol = false, fees = [] }) {
+  const [selectedSource, setSelectedSource] = useState(null);
+  const [mappingModal, setMappingModal]     = useState(null); // { sourceField, targetField, existingRow }
+  const [suggestions, setSuggestions]       = useState([]);
+
+  const mappedSrc = new Set(rows.map(r => r.sourceField).filter(Boolean));
+  const mappedTgt = new Set(rows.map(r => r.targetField).filter(Boolean));
+
+  const fieldState = (field, side) => {
+    if (side === "source") return mappedSrc.has(field.name) ? "mapped" : field.required ? "required" : "idle";
+    return mappedTgt.has(field.name) ? "mapped" : field.required ? "required" : "idle";
+  };
+
+  const handleSourceClick = (field) => {
+    setSelectedSource(prev => prev === field.name ? null : field.name);
+  };
+
+  const handleTargetClick = (field) => {
+    const existing = rows.find(r => r.targetField === field.name);
+    setMappingModal({ sourceField: selectedSource || "", targetField: field.name, existingRow: existing || null });
+  };
+
+  const handleTargetClickDirect = (field) => {
+    setMappingModal({ sourceField: selectedSource || "", targetField: field.name, existingRow: rows.find(r => r.targetField === field.name) || null });
+  };
+
+  const applyMapping = (newRow) => {
+    const cleanRow = normalizeMappingRow(newRow);
+    console.log("LINK SAVE ROW BEFORE BUILD", JSON.stringify(cleanRow, null, 2));
+    setRows(prev => {
+      const without = prev.filter(r => stringValue(r.targetField) !== cleanRow.targetField);
+      return [...without, { ...emptyRow(), ...cleanRow }];
+    });
+    setMappingModal(null);
+    setSelectedSource(null);
+  };
+
+  const removeRow = (targetField) => {
+    setRows(prev => prev.filter(r => stringValue(r.targetField) !== stringValue(targetField)));
+  };
+
+  const editRow = (row) => {
+    const cleanRow = normalizeMappingRow(row);
+    setMappingModal({ sourceField: cleanRow.sourceField || "", targetField: cleanRow.targetField, existingRow: cleanRow });
+  };
+
+  const handleAutoMatch = () => {
+    const s = suggestMappings(sourceFields, targetFields, rows);
+    setSuggestions(s);
+  };
+
+  const acceptSuggestions = () => {
+    setRows(prev => {
+      const tgts = new Set(suggestions.map(s => s.targetField));
+      const kept = prev.filter(r => !tgts.has(r.targetField));
+      const newMappings = suggestions.map(s => ({
+        ...emptyRow(s.targetField, s.sourceField),
+        mappingType: "DIRECT",
+        sourceField: s.sourceField,
+        targetField: s.targetField
+      }));
+      console.log("[AUTO-MATCH] Accepted suggestions:", newMappings);
+      return [...kept, ...newMappings];
+    });
+    setSuggestions([]);
+  };
+
+  const visibleRows = rows.filter(r => r.targetField?.trim());
+  
+  // FIX 3: Mapping counters by type
+  const counters = useMemo(() => {
+    const direct = visibleRows.filter(r => r.mappingType === "DIRECT").length;
+    const staticC = visibleRows.filter(r => r.mappingType === "STATIC").length;
+    const func = visibleRows.filter(r => r.mappingType === "FUNCTION").length;
+    const cond = visibleRows.filter(r => r.mappingType === "CONDITION").length;
+    return { direct, static: staticC, function: func, condition: cond, total: visibleRows.length };
+  }, [visibleRows]);
+
+  return (
+    <div className="la-studio">
+      {/* Studio header with FIX 3 counters */}
+      <div className="la-studio-header">
+        <div className="la-studio-labels">
+          <span>{sourceAdapterName}</span>
+          <i className="ti ti-arrows-right-left" style={{ color: "var(--muted)", fontSize: 13 }} />
+          <span>{targetAdapterName}</span>
+        </div>
+        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+          {/* FIX 3: Mapping type breakdown */}
+          {counters.total > 0 && (
+            <div style={{ display: "flex", gap: 8, fontSize: 11, color: "var(--muted)", fontWeight: 600 }}>
+              {counters.direct > 0 && <span>Direct: {counters.direct}</span>}
+              {counters.static > 0 && <span>Static: {counters.static}</span>}
+              {counters.function > 0 && <span>Function: {counters.function}</span>}
+              {counters.condition > 0 && <span>Condition: {counters.condition}</span>}
+            </div>
+          )}
+          <span className="la-studio-count">{counters.total} mapping{counters.total !== 1 ? "s" : ""}</span>
+          <button type="button" className="btn-ghost" style={{ fontSize: 12, padding: "6px 12px" }} onClick={handleAutoMatch} disabled={!sourceFields.length || !targetFields.length}>
+            <i className="ti ti-wand" /> Auto Match
+          </button>
+        </div>
+      </div>
+
+      {/* Auto-match suggestion banner */}
+      {suggestions.length > 0 && (
+        <div className="la-suggestion-bar">
+          <i className="ti ti-sparkles" />
+          <span>{suggestions.length} field{suggestions.length !== 1 ? "s" : ""} matched automatically. Review and accept.</span>
+          <div style={{ display: "flex", gap: 8, marginLeft: "auto" }}>
+            <button type="button" className="btn-ghost" style={{ fontSize: 12, padding: "5px 10px" }} onClick={() => setSuggestions([])}>Dismiss</button>
+            <button type="button" className="btn-primary" style={{ fontSize: 12, padding: "5px 12px" }} onClick={acceptSuggestions}>Accept All</button>
+          </div>
+        </div>
+      )}
+
+      {/* Hint when source selected */}
+      {selectedSource && (
+        <div className="la-hint-bar">
+          <i className="ti ti-mouse-2" />
+          <span><strong>{selectedSource}</strong> selected — now click a target field to create the mapping</span>
+          <button type="button" className="btn-ghost" style={{ fontSize: 11, padding: "4px 8px", marginLeft: "auto" }} onClick={() => setSelectedSource(null)}>Clear</button>
+        </div>
+      )}
+
+      <div className="la-studio-body">
+        {/* Source column */}
+        <div className="la-column">
+          <div className="la-column-header">
+            <strong>{sourceLabel}</strong>
+            <span>{sourceFields.length} fields</span>
+          </div>
+          <div className="la-column-body">
+            {sourceFields.length === 0
+              ? <p className="la-empty-fields">Select a request type to see fields</p>
+              : sourceFields.map(f => (
+                  <FieldPill
+                    key={f.name}
+                    field={f}
+                    state={fieldState(f, "source")}
+                    isSelected={selectedSource === f.name}
+                    onClick={() => handleSourceClick(f)}
+                  />
+                ))
+            }
+          </div>
+        </div>
+
+        {/* Mappings column */}
+        <div className="la-mappings-col">
+          <div className="la-column-header">
+            <strong>Mappings</strong>
+          </div>
+          <div className="la-mappings-body">
+            {visibleRows.length === 0 ? (
+              <div className="la-mappings-empty">
+                <i className="ti ti-arrows-exchange" style={{ fontSize: 42, opacity: 0.3 }} />
+                {/* FIX 9: Actionable empty state guidance */}
+                <div style={{ display: "flex", flexDirection: "column", gap: 10, textAlign: "center" }}>
+                  <p style={{ margin: 0, fontSize: 13, fontWeight: 600, color: "var(--heading)" }}>No mappings created yet</p>
+                  <p style={{ margin: 0, fontSize: 12, color: "var(--muted)", lineHeight: 1.6 }}>
+                    <strong>Option 1:</strong> Select a source field, then click a target field<br/>
+                    <strong>Option 2:</strong> Click "Auto Match" for smart suggestions<br/>
+                    <strong>Option 3:</strong> Use actions below for Static/Function/Condition mappings
+                  </p>
+                </div>
+              </div>
+            ) : visibleRows.map((row, i) => (
+              <MappingRow
+                key={`${row.targetField}-${i}`}
+                row={row}
+                onRemove={() => removeRow(row.targetField)}
+                onEdit={() => editRow(row)}
+              />
+            ))}
+          </div>
+          {/* FIX 4: Global action area (no per-field clutter) */}
+          <div className="la-mappings-footer">
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 8, width: "100%" }}>
+              <button
+                type="button"
+                className="btn-ghost"
+                style={{ fontSize: 11, padding: "8px 10px", display: "flex", alignItems: "center", justifyContent: "center", gap: 5 }}
+                onClick={() => setMappingModal({ sourceField: "", targetField: "", existingRow: { mappingType: "STATIC" } })}
+              >
+                <i className="ti ti-lock" /> Add Static
+              </button>
+              <button
+                type="button"
+                className="btn-ghost"
+                style={{ fontSize: 11, padding: "8px 10px", display: "flex", alignItems: "center", justifyContent: "center", gap: 5 }}
+                onClick={() => setMappingModal({ sourceField: "", targetField: "", existingRow: { mappingType: "FUNCTION" } })}
+              >
+                <i className="ti ti-function" /> Add Function
+              </button>
+              <button
+                type="button"
+                className="btn-ghost"
+                style={{ fontSize: 11, padding: "8px 10px", display: "flex", alignItems: "center", justifyContent: "center", gap: 5 }}
+                onClick={() => setMappingModal({ sourceField: "", targetField: "", existingRow: { mappingType: "CONDITION" } })}
+              >
+                <i className="ti ti-git-branch" /> Add Condition
+              </button>
+            </div>
+          </div>
+        </div>
+
+        {/* Target column */}
+        <div className="la-column">
+          <div className="la-column-header">
+            <strong>{targetLabel}</strong>
+            <span>{targetFields.length} fields</span>
+          </div>
+          <div className="la-column-body">
+            {targetFields.length === 0
+              ? <p className="la-empty-fields">Select a request type to see fields</p>
+              : targetFields.map(f => (
+                  <FieldPill
+                    key={f.name}
+                    field={f}
+                    state={fieldState(f, "target")}
+                    isSelected={false}
+                    onClick={() => handleTargetClickDirect(f)}
+                  />
+                ))
+            }
+          </div>
+        </div>
+      </div>
+
+      {mappingModal && (
+        <MappingTypeModal
+          sourceField={mappingModal.sourceField}
+          targetField={mappingModal.targetField}
+          existingRow={mappingModal.existingRow}
+          onSelect={applyMapping}
+          onCancel={() => setMappingModal(null)}
+          targetFields={targetFields}
+        />
+      )}
+    </div>
+  );
+}
+
+// ─── Integration Flow Card ────────────────────────────────────────────────────
+function IntegrationFlowCard({ outboundName, inboundName, outboundRequestName, inboundRequestName, outboundRequestNames = [] }) {
+  const targetNames = Array.isArray(outboundRequestNames) && outboundRequestNames.length
+    ? outboundRequestNames.filter(Boolean)
+    : (outboundRequestName ? [outboundRequestName] : []);
+  const multipleTargets = targetNames.length > 1;
+  const primaryTargetLabel = multipleTargets ? "Multiple Target Requests" : (outboundRequestName || targetNames[0] || "");
+  return (
+    <div className="la-flow-card">
+      <div className="la-flow-card-header">
+        <p className="la-flow-eyebrow"><i className="ti ti-topology-star-3" /> Integration Flow</p>
+      </div>
+      <div className="la-flow-diagram">
+        {/* Request path */}
+        <div className="la-flow-path">
+          <div className="la-flow-node la-flow-node--inbound">
+            <i className="ti ti-building-bank" />
+            <strong>{inboundName}</strong>
+            {inboundRequestName && <span>{inboundRequestName}</span>}
+          </div>
+          <div className="la-flow-connector la-flow-connector--req">
+            <span className="la-flow-label">SOURCE</span>
+            <div className="la-flow-line">
+              <i className="ti ti-arrow-right" />
+            </div>
+          </div>
+          <div className="la-flow-esb">
+            <i className="ti ti-circuit-switchboard" />
+            <strong>Innobridge ESB</strong>
+            <span>Transform / Route</span>
+          </div>
+          <div className="la-flow-connector la-flow-connector--req">
+            <span className="la-flow-label">TARGET</span>
+            <div className="la-flow-line">
+              <i className="ti ti-arrow-right" />
+            </div>
+          </div>
+          <div className="la-flow-node la-flow-node--outbound">
+            <i className="ti ti-device-mobile" />
+            <strong>{outboundName}</strong>
+            {primaryTargetLabel && <span>{primaryTargetLabel}</span>}
+          </div>
+        </div>
+        {multipleTargets && (
+          <div className="la-flow-path" style={{ marginTop: 14 }}>
+            <div className="la-flow-node la-flow-node--inbound la-flow-node--ghost">
+              <span>&nbsp;</span>
+            </div>
+            <div className="la-flow-connector la-flow-connector--req">
+              <div className="la-flow-line">
+                <i className="ti ti-arrow-down" />
+              </div>
+            </div>
+            <div style={{ display: "grid", gap: 8, flex: 1 }}>
+              {targetNames.map((name, index) => (
+                <div key={`${name}-${index}`} className="la-flow-node la-flow-node--outbound" style={{ minWidth: 220 }}>
+                  <i className="ti ti-arrow-down-right" />
+                  <strong>{name}</strong>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Response path */}
+        <div className="la-flow-path la-flow-path--resp">
+          <div className="la-flow-node la-flow-node--outbound la-flow-node--ghost">
+            <span>&nbsp;</span>
+          </div>
+          <div className="la-flow-connector la-flow-connector--resp">
+            <div className="la-flow-line">
+              <i className="ti ti-arrow-left" />
+            </div>
+            <span className="la-flow-label">RESPONSE</span>
+          </div>
+          <div className="la-flow-esb la-flow-node--ghost">
+            <span>&nbsp;</span>
+          </div>
+          <div className="la-flow-connector la-flow-connector--resp">
+            <div className="la-flow-line">
+              <i className="ti ti-arrow-left" />
+            </div>
+            <span className="la-flow-label">RESPONSE</span>
+          </div>
+          <div className="la-flow-node la-flow-node--inbound la-flow-node--ghost">
+            <span>&nbsp;</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function RouteFunctionsPanel({ functions, setFunctions, availableFees = [] }) {
+  const updateFn = (index, key, value) => {
+    setFunctions((current) => current.map((fn, i) => i === index ? { ...fn, [key]: value } : fn));
+  };
+
+  return (
+    <section className="la-section" style={{ marginTop: 28 }}>
+      <div className="la-section-heading">
+        <div className="la-section-badge la-section-badge--req">FUNCTIONS</div>
+        <div>
+          <h3 className="la-section-title" style={{ marginBottom: 6 }}>Route Functions</h3>
+          <p className="la-section-sub">Select fees from master data to apply during route processing.</p>
+        </div>
+        <button
+          type="button"
+          className="btn-ghost"
+          onClick={() => setFunctions((current) => [...current, createRouteFunction()])}
+        >
+          <i className="ti ti-plus" /> Add Function
+        </button>
+      </div>
+
+      <div style={{ display: "grid", gap: 14 }}>
+        {functions.map((fn, index) => {
+          const selectedFee = availableFees.find(f => f.feeId === fn.feeId);
+          return (
+            <div key={index} className="la-flow-card" style={{ padding: 16 }}>
+              <div className="field" style={{ marginBottom: 12 }}>
+                <label>Function Type</label>
+                <select value={fn.functionType || "FEE"} onChange={(e) => updateFn(index, "functionType", e.target.value)} disabled>
+                  {ROUTE_FUNCTION_TYPES.map((type) => <option key={type} value={type}>{type}</option>)}
+                </select>
+              </div>
+
+              <div className="field" style={{ marginBottom: 12 }}>
+                <label>Fee Definition *</label>
+                <select value={fn.feeId || ""} onChange={(e) => updateFn(index, "feeId", e.target.value)}>
+                  <option value="">-- Select Fee --</option>
+                  {availableFees.filter(f => f.status === "ACTIVE").map((fee, index) => (
+                    <option key={fee.feeId || fee.id || `${fee.feeCode || fee.feeName || "fee"}-${index}`} value={fee.feeId}>
+                      {fee.feeName} ({fee.feeCode})
+                    </option>
+                  ))}
+                </select>
+                {selectedFee && (
+                  <div style={{ marginTop: 8, padding: 10, background: "var(--surface)", borderRadius: 6, fontSize: 12, color: "var(--muted)" }}>
+                    <strong style={{ color: "var(--heading)" }}>{selectedFee.feeName}</strong><br/>
+                    Code: {selectedFee.feeCode} | Type: {selectedFee.feeType}
+                  </div>
+                )}
+              </div>
+              <button
+                type="button"
+                className="ar-icon-btn ar-icon-btn-danger"
+                onClick={() => setFunctions(current => current.filter((_, i) => i !== index))}
+                title="Remove function"
+              >
+                <i className="ti ti-trash" />
+              </button>
+            </div>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+// ─── Main Component ───────────────────────────────────────────────────────────
+export default function LinkAdapters({ selectedUsername }) {
+  const { loadInboundAdapters, loadOutboundAdapters } = useAPI();
+  console.log("LINK_ADAPTERS_MOUNTED");
+  const [inboundList, setInboundList]   = useState([]);
+  const [outboundList, setOutboundList] = useState([]);
+  const [selInbound, setSelInbound]     = useState("");
+  const [selInboundReq, setSelInboundReq]   = useState("");
+  const [inboundConfigs, setInboundConfigs] = useState([]);
+  const [inboundRequestTypes, setInboundRequestTypes] = useState([]);
+  const [selOutbound, setSelOutbound]   = useState("");
+  const [outboundConfigs, setOutboundConfigs] = useState([]);
+  const [outboundRequestTypes, setOutboundRequestTypes] = useState([]);
+  
+  // PHASE 1: One-to-Many Integration State
+  const [oneToManyEnabled, setOneToManyEnabled] = useState(false);
+  const [selOutbound2, setSelOutbound2] = useState("");
+  const [selOutboundReq2, setSelOutboundReq2] = useState("");
+  const [outboundConfigs2, setOutboundConfigs2] = useState([]);
+  const [outboundRequestTypes2, setOutboundRequestTypes2] = useState([]);
+  const [outboundLoading2, setOutboundLoading2] = useState(false);
+  const [selectedOutboundRequests, setSelectedOutboundRequests] = useState([]);
+  const [activeOutboundRequestTab, setActiveOutboundRequestTab] = useState("");
+  const [requestStateByOutboundRequest, setRequestStateByOutboundRequest] = useState({});
+  const [requestRows, setRequestRows]   = useState([]);
+  const [responseRows, setResponseRows] = useState([]);
+  const [routeFunctions, setRouteFunctions] = useState([createRouteFunction()]);
+  const [linkedConfigs, setLinkedConfigs]   = useState([]);
+  const [linkedConfigId, setLinkedConfigId] = useState(null);
+  const [loading, setLoading]           = useState(true);
+  const [inboundLoading, setInboundLoading]   = useState(false);
+  const [outboundLoading, setOutboundLoading] = useState(false);
+  const [status, setStatus] = useState("idle");
+  const [error, setError]   = useState("");
+  const [availableFees, setAvailableFees] = useState([]);
+  console.log("LINK_ADAPTERS_DATA", { selectedUsername, inboundList, outboundList, availableFees });
+  console.log("selectedOutboundRequests", selectedOutboundRequests);
+
+  const isInboundAdapterEntry = (item) => {
+    const id = String(getAdapterId(item)).toUpperCase();
+    const name = String(getAdapterName(item)).toUpperCase();
+    const request = String(getRequestName(item, "")).toUpperCase();
+    return (
+      id.includes("IB") ||
+      id.startsWith("TANAI_IB") ||
+      id.startsWith("ADM-IB") ||
+      name.includes("INBOUND") ||
+      name.includes("IN-") ||
+      request === "BASE_ROUTER" ||
+      request.includes("IN")
+    );
+  };
+
+  const isOutboundAdapterEntry = (item) => {
+    const id = String(getOutboundId(item)).toUpperCase();
+    const name = String(getOutboundName(item)).toUpperCase();
+    return (
+      id.includes("OB") ||
+      id.startsWith("TANAI_OB") ||
+      id.startsWith("ADM-OB") ||
+      name.includes("OUTBOUND") ||
+      name.includes("HEALTH") ||
+      name.includes("OB")
+    );
+  };
+
+  // Load adapters using centralized API context
+  useEffect(() => {
+    if (!selectedUsername) {
+      setInboundList([]);
+      setOutboundList([]);
+      setLoading(false);
+      return;
+    }
+
+    setLoading(true);
+      Promise.all([
+      loadInboundAdapters(selectedUsername),
+      loadOutboundAdapters(selectedUsername),
+      getFees(selectedUsername)
+    ]).then(([inArr, outArr, feeArr]) => {
+      const filterUser = item => {
+        if (!selectedUsername || selectedUsername === "All") return true;
+        const owner = item?.createdByUser
+          || item?.created_by_user
+          || item?.username
+          || item?.userId
+          || item?.created_by
+          || item?.owner
+          || item?.metadata?.username;
+        return !owner || String(owner).toLowerCase() === String(selectedUsername).toLowerCase();
+      };
+      const isTest = a => { const n = (getAdapterName(a)+getAdapterId(a)).toUpperCase(); return ["VERIFY","VEROB","VERIBA","CONFLICT","TEST"].some(t => n.includes(t)); };
+
+      const filteredIn  = (inArr || []).filter(filterUser).filter(isInboundAdapterEntry).filter(a => !isTest(a));
+      const filteredOut = (outArr || []).filter(filterUser).filter(isOutboundAdapterEntry).filter(a => !isTest(a));
+
+      setInboundList(filteredIn);
+      setOutboundList(filteredOut);
+      setAvailableFees(Array.isArray(feeArr) ? feeArr : []);
+
+      setLinkedConfigs([]);
+    }).catch(err => {
+      console.error('[LinkAdapters] Failed to load adapters:', err);
+    }).finally(() => setLoading(false));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedUsername]); // Only depend on selectedUsername
+
+  useEffect(() => {
+    setSelInboundReq(""); setInboundConfigs([]);
+    setInboundRequestTypes([]);
+    if (!selInbound) return;
+    setInboundLoading(true);
+    getInboundAdapterConfigurations(selInbound)
+      .then((configs) => {
+        const configsArray = Array.isArray(configs) ? configs : [];
+        setInboundConfigs(configsArray);
+        // Use configs directly as request types since listRequestTypes returns empty
+        setInboundRequestTypes(configsArray);
+      })
+      .catch((err) => {
+        console.error('[LinkAdapters] Failed to load inbound configs:', err);
+        setInboundConfigs([]);
+        setInboundRequestTypes([]);
+      })
+      .finally(() => setInboundLoading(false));
+  }, [selInbound]);
+
+  useEffect(() => {
+    setOutboundConfigs([]);
+    setOutboundRequestTypes([]);
+    setSelectedOutboundRequests([]);
+    setActiveOutboundRequestTab("");
+    setRequestStateByOutboundRequest({});
+    if (!selOutbound) return;
+    setOutboundLoading(true);
+    getOutboundAdapterConfigurations(selOutbound)
+      .then((configs) => {
+        const configsArray = Array.isArray(configs) ? configs : [];
+        setOutboundConfigs(configsArray);
+        // Use configs directly as request types since listRequestTypes returns empty
+        setOutboundRequestTypes(configsArray);
+      })
+      .catch((err) => {
+        console.error('[LinkAdapters] Failed to load outbound configs:', err);
+        setOutboundConfigs([]);
+        setOutboundRequestTypes([]);
+      })
+      .finally(() => setOutboundLoading(false));
+  }, [selOutbound]);
+
+  // PHASE 1: Load second outbound adapter configs
+  useEffect(() => {
+    setSelOutboundReq2(""); setOutboundConfigs2([]);
+    setOutboundRequestTypes2([]);
+    if (!selOutbound2 || !oneToManyEnabled) return;
+    setOutboundLoading2(true);
+    getOutboundAdapterConfigurations(selOutbound2)
+      .then((configs) => {
+        const configsArray = Array.isArray(configs) ? configs : [];
+        setOutboundConfigs2(configsArray);
+        setOutboundRequestTypes2(configsArray);
+      })
+      .catch((err) => {
+        console.error('[LinkAdapters] Failed to load outbound2 configs:', err);
+        setOutboundConfigs2([]);
+        setOutboundRequestTypes2([]);
+      })
+      .finally(() => setOutboundLoading2(false));
+  }, [selOutbound2, oneToManyEnabled]);
+
+  useEffect(() => {
+    if (oneToManyEnabled) {
+      setSelectedOutboundRequests((current) => (current.length ? current : [{}]));
+    } else {
+      setSelectedOutboundRequests((current) => current.length ? [current[0] || {}] : []);
+    }
+  }, [oneToManyEnabled]);
+
+  const snapshotCurrentOutboundRequest = (requestName = activeOutboundRequestTab || selectedOutboundRequests[0]?.requestName) => {
+    if (!requestName) return;
+    setRequestStateByOutboundRequest((current) => ({
+      ...current,
+      [requestName]: {
+        requestRows,
+        responseRows,
+        routeFunctions,
+        linkedConfigId,
+      },
+    }));
+  };
+
+  const restoreOutboundRequest = (requestName) => {
+    const saved = requestStateByOutboundRequest[requestName];
+    setRequestRows(saved?.requestRows || []);
+    setResponseRows(saved?.responseRows || []);
+    setRouteFunctions(saved?.routeFunctions || [createRouteFunction()]);
+    setLinkedConfigId(saved?.linkedConfigId || null);
+    setActiveOutboundRequestTab(requestName);
+  };
+
+  // Load existing linked config mappings
+  useEffect(() => {
+    setLinkedConfigId(null); setRequestRows([]); setResponseRows([]); setRouteFunctions([createRouteFunction()]);
+    if (!selInbound || !selInboundReq || !selOutbound || !selectedOutboundRequests.length || !selectedOutboundRequests[0]?.requestName) return;
+    loadSelectedLinkMapping(selInbound, selOutbound).catch((err) => {
+      console.error("[LinkAdapters] Failed to restore mapping:", err);
+    });
+  }, [selInbound, selOutbound]);
+
+  const inboundAdapter  = useMemo(() => inboundList.find(a=>getAdapterId(a)===selInbound),   [inboundList, selInbound]);
+  const outboundAdapter = useMemo(() => outboundList.find(a=>getOutboundId(a)===selOutbound), [outboundList, selOutbound]);
+  const inboundConfig   = useMemo(() => inboundConfigs.find((c,i)=>getConfigId(c,i)===selInboundReq || getRequestName(c,"")===selInboundReq),   [inboundConfigs, selInboundReq]);
+  const currentOutboundRequestName = selectedOutboundRequests[0]?.requestName || "";
+  const outboundConfig  = useMemo(() => outboundConfigs.find((c,i)=>getConfigId(c,i)===currentOutboundRequestName || getRequestName(c,"")===currentOutboundRequestName), [outboundConfigs, currentOutboundRequestName]);
+
+  const inboundAdapterName  = useMemo(() => getAdapterName(inboundAdapter)  || "Inbound Adapter",  [inboundAdapter]);
+  const outboundAdapterName = useMemo(() => getOutboundName(outboundAdapter) || "Outbound Adapter", [outboundAdapter]);
+  const inboundRequestName  = useMemo(() => getRequestName(inboundConfig,  selInboundReq),  [inboundConfig,  selInboundReq]);
+  const outboundRequestName = useMemo(() => getRequestName(outboundConfig, currentOutboundRequestName), [outboundConfig, currentOutboundRequestName]);
+  const outboundRequestTabNames = useMemo(
+    () => selectedOutboundRequests.map((item) => item?.requestName).filter(Boolean),
+    [selectedOutboundRequests]
+  );
+
+  useEffect(() => {
+    if (activeOutboundRequestTab && outboundRequestTabNames.includes(activeOutboundRequestTab)) return;
+    if (outboundRequestTabNames.length > 0) setActiveOutboundRequestTab(outboundRequestTabNames[0]);
+  }, [activeOutboundRequestTab, outboundRequestTabNames]);
+
+  const handleInboundRequestChange = (next) => {
+    snapshotCurrentOutboundRequest();
+    setSelInboundReq(next);
+  };
+
+  const handleOutboundRequestChange = (index, next) => {
+    snapshotCurrentOutboundRequest();
+    setSelectedOutboundRequests((current) => {
+      const updated = current.length ? [...current] : [];
+      updated[index] = { ...(updated[index] || {}), requestName: next };
+      return updated;
+    });
+    setActiveOutboundRequestTab(next);
+  };
+
+  const handleAddOutboundRequestType = () => {
+    setSelectedOutboundRequests((current) => {
+      const base = current.length ? [...current] : [{ requestName: "" }];
+      base.push({ requestName: "" });
+      return base;
+    });
+  };
+
+  const handleOutboundRequestTabClick = (name) => {
+    if (!name) return;
+    snapshotCurrentOutboundRequest();
+    restoreOutboundRequest(name);
+  };
+
+  const handleExtraOutboundRequestChange = (index, next) => {
+    snapshotCurrentOutboundRequest();
+    setSelectedOutboundRequests((current) => {
+      const updated = [...current];
+      updated[index] = { ...(updated[index] || {}), requestName: next };
+      return updated;
+    });
+    setActiveOutboundRequestTab(next);
+  };
+
+  const handleRemoveOutboundRequestType = (index) => {
+    snapshotCurrentOutboundRequest();
+    setSelectedOutboundRequests((current) => current.filter((_, i) => i !== index));
+  };
+
+  useEffect(() => {
+    if (!oneToManyEnabled) {
+      if (!selectedOutboundRequests.length && currentOutboundRequestName) {
+        setSelectedOutboundRequests([{ requestName: currentOutboundRequestName }]);
+      }
+      return;
+    }
+    setSelectedOutboundRequests((current) => {
+      const normalized = current.length ? [...current] : [{ requestName: "" }];
+      return normalized.map((item) => item && typeof item === "object" ? item : { requestName: String(item || "") });
+    });
+  }, [oneToManyEnabled]);
+
+  const loadSelectedLinkMapping = async (inboundId, outboundId) => {
+    if (!inboundId || !outboundId) return null;
+
+    const params = new URLSearchParams();
+    params.set("outbound_id", outboundId);
+    const response = await fetch(`/api/adapter-configurations/${encodeURIComponent(inboundId)}/mappings?${params.toString()}`, {
+      headers: { Accept: "application/json" },
+    });
+    const raw = await response.json();
+    const parsed = raw?.linkMapping || raw?.data?.linkMapping || raw?.mapping || raw?.data || raw || {};
+
+    const requestMappings = parsed?.requestMappings || {};
+    const responseMappings = parsed?.responseMappings || {};
+    const routeFunctionsData = parsed?.routeFunctions || parsed?.dynamicFunctions || parsed?.functions || [];
+    const outboundRequestNamesData = parsed?.outboundRequestNames || parsed?.outboundRequestNamesList || parsed?.outbound_request_names || parsed?.requestNames || [];
+    const outboundRequestNameData = parsed?.outboundRequestName || parsed?.outbound_request_name || parsed?.requestName || "";
+    const oneToManyFromResponse = Array.isArray(outboundRequestNamesData) && outboundRequestNamesData.filter(Boolean).length > 1;
+
+    setLinkedConfigId(parsed?.id || parsed?.configId || parsed?.mappingId || null);
+    setRequestRows(mappingObjectToRows(requestMappings));
+    setResponseRows(mappingObjectToRows(responseMappings));
+
+    if (oneToManyFromResponse) {
+      const normalizedNames = outboundRequestNamesData.filter(Boolean);
+      setOneToManyEnabled(true);
+      setSelectedOutboundRequests(normalizedNames.map((requestName) => ({ requestName })));
+      setActiveOutboundRequestTab(normalizedNames[0] || outboundRequestNameData || "");
+    } else if (outboundRequestNameData) {
+      setOneToManyEnabled(false);
+      setSelectedOutboundRequests([{ requestName: outboundRequestNameData }]);
+      setActiveOutboundRequestTab(outboundRequestNameData);
+    }
+
+    if (Array.isArray(routeFunctionsData) && routeFunctionsData.length > 0) {
+      setRouteFunctions(routeFunctionsData.map(normalizeRouteFunction));
+    } else if (routeFunctionsData && typeof routeFunctionsData === "object") {
+      setRouteFunctions(Object.values(routeFunctionsData).map(normalizeRouteFunction));
+    }
+
+    return parsed;
+  };
+
+  // Field extraction
+  const outboundRequestFields = useMemo(() => {
+    const protocolFields = extractProtocolFieldsFromConfig(outboundConfig, "request");
+    return isStrictProtocolFormat(outboundConfig) ? protocolFields : (protocolFields.length > 0 ? protocolFields : extractFields(getPath(outboundConfig, REQUEST_SCHEMA_KEYS)));
+  }, [outboundConfig]);
+  const inboundRequestFields = useMemo(() => {
+    const protocolFields = extractProtocolFieldsFromConfig(inboundConfig, "request");
+    return isStrictProtocolFormat(inboundConfig) ? protocolFields : (protocolFields.length > 0 ? protocolFields : extractFields(getPath(inboundConfig, REQUEST_SCHEMA_KEYS)));
+  }, [inboundConfig]);
+  const inboundResponseFields = useMemo(() => {
+    const protocolFields = extractProtocolFieldsFromConfig(inboundConfig, "response");
+    return isStrictProtocolFormat(inboundConfig) ? protocolFields : (protocolFields.length > 0 ? protocolFields : extractFields(getPath(inboundConfig, RESPONSE_SCHEMA_KEYS)));
+  }, [inboundConfig]);
+  const outboundResponseFields = useMemo(() => {
+    const protocolFields = extractProtocolFieldsFromConfig(outboundConfig, "response");
+    return isStrictProtocolFormat(outboundConfig) ? protocolFields : (protocolFields.length > 0 ? protocolFields : extractFields(getPath(outboundConfig, RESPONSE_SCHEMA_KEYS)));
+  }, [outboundConfig]);
+
+  const requestMappings  = useMemo(() => buildMappingObject(requestRows),  [requestRows]);
+  const responseMappings = useMemo(() => buildMappingObject(responseRows), [responseRows]);
+
+  const hasValidRequestMappings = oneToManyEnabled
+    ? selectedOutboundRequests.some((item) => !!item?.requestName)
+    : !!selectedOutboundRequests[0]?.requestName;
+  const canSave = selInbound && selOutbound && selInboundReq && hasValidRequestMappings && status !== "saving";
+
+  // PAYLOAD AUDIT ROUND 2: Match exact backend schema requirements
+  const handleSave = async () => {
+    if (!canSave) return;
+    setStatus("saving"); setError("");
+    try {
+      snapshotCurrentOutboundRequest();
+      const outboundRequestNames = oneToManyEnabled
+        ? outboundRequestTabNames
+        : (selectedOutboundRequests[0]?.requestName ? [selectedOutboundRequests[0].requestName] : []);
+      const outboundRequestState = Object.entries(requestStateByOutboundRequest).reduce((acc, [key, value]) => {
+        if (!key) return acc;
+        acc[key] = {
+          requestMappings: buildMappingObject(value?.requestRows || []),
+          responseMappings: buildMappingObject(value?.responseRows || []),
+          routeFunctions: routeFunctionsToPayload(value?.routeFunctions || []),
+          linkedConfigId: value?.linkedConfigId || null,
+        };
+        return acc;
+      }, {});
+      const activeTabState = {
+        requestMappings,
+        responseMappings,
+        routeFunctions: routeFunctionsToPayload(routeFunctions),
+        linkedConfigId,
+      };
+      if (activeOutboundRequestTab || selectedOutboundRequests[0]?.requestName) {
+        outboundRequestState[activeOutboundRequestTab || selectedOutboundRequests[0]?.requestName] = activeTabState;
+      }
+
+      console.log("SAVE_ARRAY", JSON.stringify(selectedOutboundRequests, null, 2));
+      console.log("SAVE_TAB_NAMES", JSON.stringify(outboundRequestTabNames, null, 2));
+      console.log("SAVE_ONETOMANY", oneToManyEnabled);
+
+      console.log("LINK SAVE OUTBOUND FLAG STATE", JSON.stringify({
+        oneToManyEnabled,
+        selectedOutboundRequests,
+        outboundRequestNames,
+        outboundRequestName: outboundRequestName || selectedOutboundRequests[0]?.requestName || null,
+      }, null, 2));
+      console.log("LINK SAVE BRANCH", oneToManyEnabled ? "if (oneToManyEnabled)" : "else");
+
+      console.log("LINK SAVE ROW MODEL", JSON.stringify({
+        requestRows: requestRows.map(normalizeMappingRow),
+        responseRows: responseRows.map(normalizeMappingRow),
+      }, null, 2));
+
+      // Backend contract analysis:
+      // - Inbound adapter requires: adapterId, adapterName, type, requestName, configurations[]
+      // - Outbound adapter requires: outboundId, name
+      // - Each configuration in configurations[] must include requestMappings/responseMappings
+      // - The backend generates the persisted route name from adapter IDs.
+      
+      const payload = {
+        inboundAdapterId: selInbound,
+        outboundAdapterId: selOutbound,
+        inboundRequestName: inboundRequestName || selInboundReq || null,
+        requestMappings,
+        responseMappings,
+        dynamicFunctions: routeFunctionsToPayload(routeFunctions),
+        routeFunctions: routeFunctionsToPayload(routeFunctions),
+        outboundRequestState: oneToManyEnabled ? outboundRequestState : undefined,
+      };
+
+      if (oneToManyEnabled) {
+        payload.outboundRequestNames = outboundRequestNames.length > 0 ? outboundRequestNames : (selectedOutboundRequests.map((item) => item?.requestName).filter(Boolean));
+      } else {
+        payload.outboundRequestName = outboundRequestName || selectedOutboundRequests[0]?.requestName || null;
+      }
+
+      console.log("LINK SAVE PAYLOAD", JSON.stringify(payload, null, 2));
+      console.log("LINK SAVE BUILD_MAPPING_OBJECT", JSON.stringify({
+        requestMappings,
+        responseMappings,
+      }, null, 2));
+
+      console.log(
+        "\n═══════════════════════════════════════════════════════════" +
+        "\n  FINAL SAVE PAYLOAD (ROUND 2)" +
+        "\n═══════════════════════════════════════════════════════════\n"
+      );
+      console.log(JSON.stringify(payload, null, 2));
+      console.log(
+        "\n═══════════════════════════════════════════════════════════\n"
+      );
+
+      const endpoint = "/api/adapter-configurations/save-mapping";
+      console.log("LINK SAVE REQUEST", endpoint, JSON.stringify(payload, null, 2));
+      console.log("LINK SAVE REQUEST FRONTEND PAYLOAD", JSON.stringify(payload, null, 2));
+
+      await saveLinkedAdapterMapping(payload);
+      invalidateCachePrefix("linked-adapter-configurations");
+      
+      setStatus("success");
+      setTimeout(() => {
+        setStatus("idle");
+        loadSelectedLinkMapping(selInbound, selOutbound).catch(()=>{});
+      }, 2200);
+    } catch (e) {
+      // Extract backend validation error messages
+      const backendMsg = e?.response?.data?.message || e?.response?.data?.error?.message || e?.response?.data?.error || e?.message;
+      if (backendMsg) {
+        setError(`Save failed: ${backendMsg}`);
+      } else {
+        setError("Failed to save integration. Please review the mappings and try again.");
+      }
+      setStatus("error");
+      console.error('\n[LinkAdapters] Save error - Full response:', e?.response?.data);
+      console.error('[LinkAdapters] Error object:', e);
+    }
+  };
+
+  if (loading) return <p className="status loading">Loading adapters…</p>;
+
+  return (
+    <div className="la-page">
+
+      {/* ── Adapter Selection ─────────────────────────────────────────── */}
+      <section className="la-setup-card">
+        <div className="la-setup-heading">
+          <div>
+            <p className="ca-eyebrow" style={{ margin: 0 }}>Adapter Integration</p>
+            <h2 className="ca-title" style={{ margin: "2px 0 0" }}>Link Adapters</h2>
+            <p style={{ margin: "4px 0 0", fontSize: 13, color: "var(--muted)" }}>
+              Select source and target adapters, then configure field mappings.
+            </p>
+          </div>
+        </div>
+
+        <div className="la-setup-grid">
+          <div className="la-setup-side">
+            <div className="la-setup-side-badge la-setup-side-badge--in">SOURCE (INBOUND)</div>
+            <div className="field">
+              <label>Adapter</label>
+              <select value={selInbound} onChange={e => setSelInbound(e.target.value)}>
+                <option value="">Select inbound adapter?</option>
+                {inboundList.map((a, i) => <option key={`${getAdapterId(a)}-${i}`} value={getAdapterId(a)}>{getAdapterName(a)}</option>)}
+              </select>
+            </div>
+          </div>
+
+          <div className="la-setup-sep">
+            <i className="ti ti-arrows-right-left" />
+          </div>
+
+          <div className="la-setup-side">
+            <div className="la-setup-side-badge la-setup-side-badge--out">TARGET (OUTBOUND)</div>
+            <div className="field">
+              <label>Adapter</label>
+              <select value={selOutbound} onChange={e => setSelOutbound(e.target.value)}>
+                <option value="">Select outbound adapter?</option>
+                {outboundList.map((a, i) => <option key={`${getOutboundId(a)}-${i}`} value={getOutboundId(a)}>{getOutboundName(a)}</option>)}
+              </select>
+            </div>
+          </div>
+        </div>
+      </section>
+
+
+      <section className="la-section" style={{ marginTop: 28 }}>
+        <div className="la-flow-card" style={{ padding: 16 }}>
+          <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 16, marginBottom: 14 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+              <div className="la-section-badge la-section-badge--req">REQUEST</div>
+              <div>
+                <h3 className="la-section-title" style={{ margin: 0 }}>Request Configuration</h3>
+                <p className="la-section-sub" style={{ margin: "4px 0 0" }}>Keep one inbound request type and add outbound request tabs when required.</p>
+              </div>
+            </div>
+            <label style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 13, fontWeight: 600, whiteSpace: "nowrap" }}>
+              <input
+                type="checkbox"
+                checked={oneToManyEnabled}
+                onChange={(e) => {
+                  const checked = e.target.checked;
+                  setOneToManyEnabled(checked);
+                  if (!checked) {
+                    setSelectedOutboundRequests((current) => current.length ? [current[0]] : []);
+                    setActiveOutboundRequestTab(selectedOutboundRequests[0]?.requestName || "");
+                  } else if (!selectedOutboundRequests.length && currentOutboundRequestName) {
+                    setSelectedOutboundRequests([{ requestName: currentOutboundRequestName }]);
+                  }
+                }}
+              />
+              Multiple Outbound Request Types
+            </label>
+          </div>
+
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, alignItems: "start" }}>
+            <div className="field">
+              <label style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>Inbound Request Type</label>
+              <select
+                value={selInboundReq}
+                onChange={(e) => handleInboundRequestChange(e.target.value)}
+                disabled={!selInbound || inboundLoading}
+                style={{ height: 32 }}
+              >
+                <option value="">{selInbound ? "Select inbound request type" : "Select inbound adapter first"}</option>
+                {inboundRequestTypes.map((c, i) => {
+                  const name = getRequestName(c, "");
+                  const id = getConfigId(c, i) || name;
+                  return name ? <option key={id} value={name}>{name}</option> : null;
+                })}
+              </select>
+            </div>
+
+            <div className="field">
+              <label style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>Outbound Request Type</label>
+              <div style={{ display: "grid", gap: 10 }}>
+                {(oneToManyEnabled ? (selectedOutboundRequests.length ? selectedOutboundRequests : [{ requestName: "" }]) : [{ requestName: selectedOutboundRequests[0]?.requestName || "" }]).map((row, index) => (
+                  <div key={`outbound-request-${index}`} style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 10, alignItems: "center" }}>
+                    <select
+                      value={row?.requestName || ""}
+                      onChange={(e) => handleOutboundRequestChange(index, e.target.value)}
+                      disabled={!selOutbound || outboundLoading}
+                      style={{ height: 32 }}
+                    >
+                      <option value="">{selOutbound ? "Select outbound request type" : "Select outbound adapter first"}</option>
+                      {outboundRequestTypes.map((c, i) => {
+                        const name = getRequestName(c, "");
+                        const id = getConfigId(c, i) || name;
+                        return name && name !== (row?.requestName || "") ? <option key={id} value={name}>{name}</option> : null;
+                      })}
+                    </select>
+                    {oneToManyEnabled && index > 0 && (
+                      <button
+                        type="button"
+                        className="ar-icon-btn ar-icon-btn-danger"
+                        onClick={() => handleRemoveOutboundRequestType(index)}
+                        title="Remove outbound request type"
+                        aria-label="Remove outbound request type"
+                        style={{ minWidth: 44, height: 44, display: "inline-flex", alignItems: "center", justifyContent: "center", border: "1px solid var(--danger)", background: "rgba(239,68,68,0.08)", color: "var(--danger)", opacity: 1 }}
+                      >
+                        <i className="ti ti-trash" style={{ fontSize: 16 }} />
+                      </button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          {oneToManyEnabled && (
+            <div style={{ marginTop: 12, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+              <p style={{ margin: 0, color: "var(--muted)", fontSize: 13 }}>
+                Add more outbound request tabs for the same adapter pair.
+              </p>
+              <button
+                type="button"
+                className="btn-ghost"
+                onClick={handleAddOutboundRequestType}
+                disabled={!selOutbound || outboundLoading}
+                style={{ padding: "6px 12px", fontSize: 12, height: 32 }}
+              >
+                <i className="ti ti-plus" /> Add Request Type
+              </button>
+            </div>
+          )}
+
+          {oneToManyEnabled && outboundRequestTabNames.length > 0 && (
+            <div style={{ marginTop: 14, display: "flex", flexWrap: "wrap", gap: 10 }}>
+              {outboundRequestTabNames.map((name) => (
+                <button
+                  key={name}
+                  type="button"
+                  onClick={() => handleOutboundRequestTabClick(name)}
+                  className="btn-ghost"
+                  style={{
+                    padding: "8px 14px",
+                    fontSize: 13,
+                    borderRadius: 999,
+                    border: activeOutboundRequestTab === name ? "1px solid var(--primary)" : "1px solid var(--border)",
+                    background: activeOutboundRequestTab === name ? "rgba(22,163,74,0.08)" : "var(--card)",
+                    color: "var(--heading)",
+                  }}
+                >
+                  {name}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {oneToManyEnabled && (
+            <pre style={{ margin: "10px 0 0", padding: 10, borderRadius: 8, background: "rgba(0,0,0,0.04)", fontSize: 12, color: "var(--muted)", overflowX: "auto" }}>
+              {JSON.stringify(selectedOutboundRequests.map((item) => item?.requestName).filter(Boolean))}
+            </pre>
+          )}
+
+          <IntegrationFlowCard
+            outboundName={outboundAdapterName}
+            inboundName={inboundAdapterName}
+            outboundRequestName={outboundRequestName}
+            inboundRequestName={inboundRequestName}
+            outboundRequestNames={oneToManyEnabled ? outboundRequestTabNames : [selectedOutboundRequests[0]?.requestName].filter(Boolean)}
+          />
+
+          <div style={{ marginTop: 18 }}>
+            <div className="la-flow-card" style={{ padding: 16 }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, marginBottom: 12 }}>
+                <div>
+                  <h4 style={{ margin: 0, color: "var(--heading)" }}>
+                    Currently Editing
+                  </h4>
+                  <p style={{ margin: "4px 0 0", color: "var(--muted)", fontSize: 13 }}>
+                    {activeOutboundRequestTab || selectedOutboundRequests[0]?.requestName || "Select an outbound request type to configure its mappings."}
+                  </p>
+                </div>
+                <span className="la-section-badge la-section-badge--req">PIPELINE</span>
+              </div>
+
+              {selInboundReq ? (
+                <>
+                  <MappingStudio
+                    sourceLabel={`${inboundAdapterName} Request Fields`}
+                    targetLabel={`${outboundAdapterName} Request Fields`}
+                    sourceAdapterName={outboundAdapterName}
+                    targetAdapterName={inboundAdapterName}
+                    sourceFields={inboundRequestFields}
+                    targetFields={outboundRequestFields}
+                    rows={requestRows}
+                    setRows={setRequestRows}
+                    isStrictProtocol={isStrictProtocolFormat(inboundConfig) || isStrictProtocolFormat(outboundConfig)}
+                    fees={availableFees}
+                  />
+
+                  <div style={{ marginTop: 18 }}>
+                    <MappingStudio
+                      sourceLabel={`${outboundAdapterName} Response Fields`}
+                      targetLabel={`${inboundAdapterName} Response Fields`}
+                      sourceAdapterName={outboundAdapterName}
+                      targetAdapterName={inboundAdapterName}
+                      sourceFields={outboundResponseFields}
+                      targetFields={inboundResponseFields}
+                      rows={responseRows}
+                      setRows={setResponseRows}
+                      isStrictProtocol={isStrictProtocolFormat(inboundConfig) || isStrictProtocolFormat(outboundConfig)}
+                      fees={availableFees}
+                    />
+                  </div>
+                </>
+              ) : (
+                <div style={{ padding: "18px 4px", color: "var(--muted)", fontSize: 14 }}>
+                  Select an inbound request type to configure the mapping designer.
+                </div>
+              )}
+            </div>
+          </div>
+
+          {oneToManyEnabled && (
+            <div style={{ marginTop: 18 }}>
+              <div className="la-flow-card" style={{ padding: 16 }}>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, marginBottom: 12 }}>
+                  <div>
+                    <h4 style={{ margin: 0, color: "var(--heading)" }}>Response Aggregation Mapping</h4>
+                    <p style={{ margin: "4px 0 0", color: "var(--muted)", fontSize: 13 }}>
+                      Merge fields from multiple downstream responses into the final inbound response.
+                    </p>
+                  </div>
+                  <span className="la-section-badge la-section-badge--resp">AGGREGATION</span>
+                </div>
+                <MappingStudio
+                  sourceLabel="Downstream Response Fields"
+                  targetLabel="Inbound Response Fields"
+                  sourceAdapterName={outboundAdapterName}
+                  targetAdapterName={inboundAdapterName}
+                  sourceFields={outboundResponseFields}
+                  targetFields={inboundResponseFields}
+                  rows={responseRows}
+                  setRows={setResponseRows}
+                  isStrictProtocol={isStrictProtocolFormat(inboundConfig) || isStrictProtocolFormat(outboundConfig)}
+                  fees={availableFees}
+                />
+              </div>
+            </div>
+          )}
+        </div>
+      </section>
+
+        <RouteFunctionsPanel
+          functions={routeFunctions}
+          setFunctions={setRouteFunctions}
+          availableFees={availableFees}
+        />
+
+
+
+
+      {/* ── Save ──────────────────────────────────────────────────────── */}
+      <div className="la-save-bar">
+        <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+          <strong style={{ fontSize: 13, color: "var(--heading)" }}>
+            {requestRows.filter(r=>r.targetField).length + responseRows.filter(r=>r.targetField).length} total mappings
+          </strong>
+          <span style={{ fontSize: 12, color: "var(--muted)" }}>
+            {linkedConfigId ? "Updating existing integration" : "Creating new integration"}
+          </span>
+        </div>
+        {error && <span style={{ fontSize: 13, color: "var(--danger)", flex: 1 }}>{error}</span>}
+        <button
+          type="button"
+          className="btn-primary"
+          onClick={handleSave}
+          disabled={!canSave}
+          style={{ padding: "11px 28px", fontSize: 14, ...(status === "success" ? { background: "var(--success)" } : {}) }}
+        >
+          {status === "saving"  ? <><i className="ti ti-loader-2 spin" /> Saving…</> :
+           status === "success" ? <><i className="ti ti-check" /> Saved</> :
+                                  <><i className="ti ti-device-floppy" /> Save Integration</>}
+        </button>
+      </div>
+    </div>
+  );
+}

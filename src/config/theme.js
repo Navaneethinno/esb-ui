@@ -1,0 +1,52 @@
+export const APP_CONFIG = {
+  brand: {
+    appName: "InnoBridge",
+    subtitle: "Integration Platform",
+    logo: "",
+    mark: "IB",
+  },
+  api: {
+    devBasePath: "/api",
+    fallbackBaseUrl: "/api",
+    timeoutMs: 30000,
+    enableDebugLogs: true,
+  },
+  defaults: {
+    timeoutSeconds: 30,
+    retryCount: 0,
+    sendEnabled: true,
+    method: "POST",
+  },
+  options: {
+    protocols: ["HTTP", "HTTPS", "TCP", "FILE", "DATABASE"],
+    httpProtocols: ["HTTP", "HTTPS"],
+    subtypeFormats: ["ISO8583", "ISO20022"],
+  },
+  theme: {
+    fontFamily: '"Roboto", ui-sans-serif, system-ui, sans-serif',
+    light: {
+      bg: "#f6f7f9",
+      surface: "#ffffff",
+      surfaceSoft: "#f0f3f6",
+      text: "#243040",
+      muted: "#6b7583",
+      heading: "#111827",
+      border: "#d9e0e7",
+      primary: "#0f766e",
+      primaryStrong: "#0b5f59",
+      primarySoft: "#d9f1ed",
+    },
+    dark: {
+      bg: "#0f0f0e",
+      surface: "#1c1c1a",
+      surfaceSoft: "#2a2b28",
+      text: "#dfddd8",
+      muted: "#aaa69e",
+      heading: "#f5f2ec",
+      border: "#2a2b28",
+      primary: "#5b4fcf",
+      primaryStrong: "#4a3fb8",
+      primarySoft: "rgba(91, 79, 207, 0.15)",
+    },
+  },
+};

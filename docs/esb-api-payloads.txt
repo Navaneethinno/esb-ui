@@ -1,0 +1,412 @@
+ESB API Payloads
+
+This file is the frontend handoff reference for the active ESB APIs.
+
+Base URL example:
+http://localhost:8000
+
+1. Request Type APIs
+
+List request types:
+GET /api/request-type/list
+GET /api/request-type/list?format=iso8583
+GET /api/request-type/list?format=iso20022
+
+Purpose:
+- populate request-type dropdown
+
+Get request type contract:
+GET /api/request-type/contract/FINANCIAL_PURCHASE
+
+Purpose:
+- fetch canonical schema and protocol metadata for a selected request type
+
+Resolve aliases to canonical fields:
+POST /api/request-type/resolve
+Content-Type: application/json
+
+{
+  "request_type": "FINANCIAL_PURCHASE",
+  "input_data": {
+    "custId": "4111111111111111",
+    "amount": 100,
+    "currency": "840",
+    "txnId": "123456",
+    "txnType": "000000"
+  }
+}
+
+2. Canonical Suggest API
+
+Get mapping suggestions:
+POST /api/canonical/suggest
+Content-Type: application/json
+
+{
+  "source_fields": ["customerId", "amount", "currency"],
+  "format": "json"
+}
+
+Purpose:
+- suggest canonical mapping for free-form input fields
+
+3. File Upload API
+
+Upload CSV / text / SQLite input:
+POST /api/v1/esb/upload
+Content-Type: multipart/form-data
+
+Form data:
+file = <uploaded file>
+format = file
+
+or:
+file = <uploaded sqlite file>
+format = database
+
+4. Custom Function Validation
+
+Validate custom expression:
+POST /api/validate-custom-function
+Content-Type: application/json
+
+{
+  "expression": "TotalAmt = Amt + Fee",
+  "inboundFormat": "JSON",
+  "outboundFormat": "XML"
+}
+
+5. Transform API
+
+Convert inbound data into canonical display-name data:
+POST /api/v1/esb/transform
+Content-Type: application/json
+
+{
+  "requestType": "FINANCIAL_PURCHASE",
+  "inboundType": "json",
+  "outboundType": "xml",
+  "payload": {
+    "customerId": "C001",
+    "amount": 1000,
+    "currency": "INR",
+    "txnId": "TXN001"
+  },
+  "mapping": {
+    "customerId": "CUST",
+    "amount": "AMT",
+    "currency": "CURRENCY",
+    "txnId": "TXNID"
+  },
+  "transformFunctions": [
+    {
+      "name": "getDate",
+      "enabled": true,
+      "config": {
+        "dateFormat": "YYYY-MM-DD"
+      }
+    }
+  ],
+  "fieldPurposes": {},
+  "manualFieldValues": {}
+}
+
+Notes:
+- for iso8583 and iso20022 input, send protocol payload directly
+- keep mapping and transformFunctions empty for strict protocol parsing
+
+6. Execute API
+
+Convert canonical data into final target output:
+POST /api/v1/esb/execute
+Content-Type: application/json
+
+{
+  "inboundType": "json",
+  "outboundType": "xml",
+  "payload": {
+    "CUST": "C001",
+    "AMT": 1000,
+    "CURRENCY": "INR",
+    "TXNID": "TXN001"
+  },
+  "meta": {
+    "correlationId": "CORR-001"
+  },
+  "xmlConfig": {
+    "rootTag": "transaction"
+  },
+  "iso8583Config": {
+    "requestType": "FINANCIAL_PURCHASE",
+    "mti": "0200",
+    "outputEncoding": "json"
+  }
+}
+
+Purpose:
+- produce final JSON/XML/ISO8583/ISO20022/file/database output
+
+7. Combined Inbound + Outbound Config API
+
+Create linked inbound and outbound config in one call:
+POST /api/adapter-configurations
+Content-Type: application/json
+
+{
+  "inbound": {
+    "adapterId": "BANK_A_INBOUND",
+    "adapterName": "BANK_A_INBOUND",
+    "type": "JSON",
+    "requestName": "PAYMENT_REQUEST",
+    "requestBody": {},
+    "conversionLimit": 2,
+    "configurations": [
+      {
+        "configId": "JSON_TO_XML_PAYMENT",
+        "type": "JSON",
+        "requestName": "PAYMENT_REQUEST",
+        "sourceFormat": "JSON",
+        "targetFormat": "XML",
+        "transformType": "JSON_TO_XML"
+      }
+    ]
+  },
+  "outbound": {
+    "outboundId": "PARTNER_HTTP_SERVER",
+    "name": "Partner HTTP Server",
+    "protocol": "HTTP",
+    "host": "127.0.0.1",
+    "port": 9001,
+    "path": "/sink",
+    "method": "POST",
+    "format": "XML",
+    "timeoutSeconds": 10,
+    "retryCount": 0,
+    "sendEnabled": true,
+    "headers": {
+      "X-Test-Source": "ESB"
+    }
+  }
+}
+
+List all adapter configurations:
+GET /api/adapter-configurations
+
+Expected response shape:
+[
+  {
+    "adapterId": "BANK_A_INBOUND",
+    "adapterName": "BANK_A_INBOUND",
+    "type": "JSON",
+    "active": true,
+    ...
+  }
+]
+
+Get one adapter configuration (inbound + linked outbound):
+GET /api/adapter-configurations/BANK_A_INBOUND
+
+Expected response shape:
+{
+  "inbound": { ... },
+  "outbound": { ... }
+}
+
+Soft-delete adapter configuration:
+DELETE /api/adapter-configurations/BANK_A_INBOUND
+
+Sets active = FALSE on inbound_adapter_master and all linked outbound_adapter_master rows.
+No data is lost. Fully reversible.
+
+Expected response shape:
+{
+  "status": "deleted",
+  "adapterId": "BANK_A_INBOUND"
+}
+
+Update linked inbound and outbound config:
+PUT /api/adapter-configurations/BANK_A_INBOUND
+PATCH /api/adapter-configurations/BANK_A_INBOUND
+Content-Type: application/json
+
+Use the same body shape as create.
+
+8. Inbound Adapter APIs
+
+List inbound adapters:
+GET /api/inbound-adapters
+
+Create inbound adapter:
+POST /api/inbound-adapters
+Content-Type: application/json
+
+{
+  "adapterId": "BANK_A_INBOUND",
+  "adapterName": "BANK_A_INBOUND",
+  "type": "JSON",
+  "requestName": "PAYMENT_REQUEST",
+  "requestBody": {},
+  "conversionLimit": 2,
+  "configurations": [
+    {
+      "configId": "JSON_TO_XML_PAYMENT",
+      "type": "JSON",
+      "requestName": "PAYMENT_REQUEST",
+      "sourceFormat": "JSON",
+      "targetFormat": "XML",
+      "transformType": "JSON_TO_XML",
+      "outboundId": "PARTNER_HTTP_SERVER"
+    }
+  ]
+}
+
+Get one inbound adapter:
+GET /api/inbound-adapters/BANK_A_INBOUND
+
+Update inbound adapter:
+PUT /api/inbound-adapters/BANK_A_INBOUND
+PATCH /api/inbound-adapters/BANK_A_INBOUND
+Content-Type: application/json
+
+Add or update one inbound configuration:
+POST /api/inbound-adapters/BANK_A_INBOUND/configurations
+PUT /api/inbound-adapters/BANK_A_INBOUND/configurations/JSON_TO_XML_PAYMENT
+PATCH /api/inbound-adapters/BANK_A_INBOUND/configurations/JSON_TO_XML_PAYMENT
+Content-Type: application/json
+
+{
+  "configId": "JSON_TO_XML_PAYMENT",
+  "type": "JSON",
+  "requestName": "PAYMENT_REQUEST",
+  "sourceFormat": "JSON",
+  "targetFormat": "XML",
+  "transformType": "JSON_TO_XML",
+  "outboundId": "PARTNER_HTTP_SERVER"
+}
+
+9. Trigger Inbound Adapter
+
+Trigger conversion and outbound routing:
+POST /api/inbound-adapters/BANK_A_INBOUND/trigger
+Content-Type: application/json
+
+{
+  "adapterName": "BANK_A_INBOUND",
+  "configId": "JSON_TO_XML_PAYMENT",
+  "payload": {
+    "customerId": "C100",
+    "amount": 1250,
+    "currency": "INR"
+  },
+  "meta": {
+    "requestId": "REQ-TEST-001",
+    "timestamp": "2026-05-11T10:00:00Z"
+  }
+}
+
+Expected response shape:
+{
+  "status": "success",
+  "processedCount": 1,
+  "results": [
+    {
+      "fileId": "file-1",
+      "configId": "JSON_TO_XML_PAYMENT",
+      "requestName": "PAYMENT_REQUEST",
+      "transformType": "JSON_TO_XML",
+      "status": "success",
+      "transformStatus": "success",
+      "outboundStatus": "sent",
+      "routing": {
+        "outboundId": "PARTNER_HTTP_SERVER",
+        "destination": "http://127.0.0.1:9001/sink",
+        "protocol": "HTTP"
+      },
+      "delivery": {
+        "status": "sent",
+        "statusCode": 200
+      }
+    }
+  ]
+}
+
+Batch trigger:
+{
+  "adapterName": "BANK_A_INBOUND",
+  "configId": "JSON_TO_XML_PAYMENT",
+  "files": [
+    {
+      "fileId": "a.json",
+      "data": {
+        "customerId": "C001",
+        "amount": 10
+      }
+    },
+    {
+      "fileId": "b.json",
+      "data": {
+        "customerId": "C002",
+        "amount": 20
+      }
+    }
+  ]
+}
+
+10. Outbound Adapter APIs
+
+List outbound adapters:
+GET /api/outbound-adapters
+
+Create outbound adapter:
+POST /api/outbound-adapters
+Content-Type: application/json
+
+{
+  "outboundId": "PARTNER_HTTP_SERVER",
+  "name": "Partner HTTP Server",
+  "protocol": "HTTP",
+  "host": "127.0.0.1",
+  "port": 9001,
+  "path": "/sink",
+  "method": "POST",
+  "format": "XML",
+  "timeoutSeconds": 10,
+  "retryCount": 0,
+  "sendEnabled": true
+}
+
+Get one outbound adapter:
+GET /api/outbound-adapters/PARTNER_HTTP_SERVER
+
+Update outbound adapter:
+PUT /api/outbound-adapters/PARTNER_HTTP_SERVER
+PATCH /api/outbound-adapters/PARTNER_HTTP_SERVER
+Content-Type: application/json
+
+11. Active Outbound Protocols
+
+Supported protocol values:
+HTTP
+HTTPS
+TCP
+FILE
+DATABASE
+
+Supported format examples:
+JSON
+XML
+ISO8583
+ISO20022
+
+12. Main Backend Route Files
+
+Frontend can use these source files if needed:
+- services/adapter_configuration_api.py
+- services/dynamic_inbound_adapter_api.py
+- services/dynamic_outbound_adapter_api.py
+- app.py
+
+13. Single Source Note
+
+For detailed backend behavior, DB flow, and architecture notes, also see:
+- README.md

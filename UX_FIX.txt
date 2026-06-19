@@ -1,0 +1,11 @@
+UX Alignment Issues Identified:
+
+1. Checkbox position - misaligned with section heading
+2. "Add Request Type" button - not aligned with label
+3. Additional request type dropdowns - inconsistent spacing
+4. Delete button size - too large and misaligned
+
+Changes to apply:
+- Improve label and button alignment in outbound request type section
+- Fix grid layout for additional request types
+- Standardize button sizing and spacing

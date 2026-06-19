@@ -1,0 +1,708 @@
+﻿import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  deleteAdapterConfiguration,
+  getApiErrorMessage,
+  getCanonicalFields,
+  listUserAdapters,
+  startAdapter,
+  stopAdapter,
+  triggerInboundAdapter,
+  upsertInboundConfiguration,
+} from "../services/esbApi";
+import { resolveStatus, resolveRunStatus, normalizeRows } from "../utils/adapterUtils";
+import { cachedFetch, invalidateCache } from "../utils/apiCache";
+
+function formatDate(value) {
+  if (!value) return null;
+  const d = new Date(value);
+  if (isNaN(d.getTime())) return String(value);
+  return {
+    date: d.toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" }),
+    time: d.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", second: "2-digit" }) + " UTC",
+  };
+}
+
+function RunStatusBadge({ runStatus }) {
+  const running = runStatus === "RUNNING";
+  return (
+    <span className={`run-badge ${running ? "run-badge-running" : "run-badge-stopped"}`}>
+      <span className={`run-dot ${running ? "run-dot-pulse" : ""}`} />
+      {running ? "Running" : "Stopped"}
+    </span>
+  );
+}
+
+function AdapterIcon({ status }) {
+  const s = resolveStatus(status);
+  if (s === "error")  return <div className="ar-icon ar-icon-error"><i className="ti ti-alert-triangle" /></div>;
+  if (s === "active") return <div className="ar-icon ar-icon-success"><i className="ti ti-plug-connected" /></div>;
+  return <div className="ar-icon ar-icon-idle"><i className="ti ti-refresh" /></div>;
+}
+
+/* Payload Template Builder (reused in Add Request Type modal) */
+function TemplateBuilder({ value, onChange, canonicalFields }) {
+  const textareaRef = useRef(null);
+  const cursorPos   = useRef(null);
+
+  function insert(fieldName) {
+    const current = value;
+    const closingBrace = current.lastIndexOf("}");
+    const saved = cursorPos.current;
+    let cursor;
+    if (saved == null) {
+      cursor = closingBrace >= 0 ? closingBrace : current.length;
+    } else {
+      cursor = closingBrace >= 0 && saved >= closingBrace ? closingBrace : saved;
+    }
+    const before = current.slice(0, cursor);
+    const after  = current.slice(cursor);
+    const needsComma = /"\s*$/.test(before);
+    const snippet = (needsComma ? ",\n    " : "    ") + `"${fieldName}": "${fieldName}"\n`;
+    const next = before + snippet + after;
+    const newCursor = cursor + snippet.length;
+    cursorPos.current = newCursor;
+    onChange(next);
+    requestAnimationFrame(() => {
+      if (textareaRef.current) {
+        textareaRef.current.focus();
+        textareaRef.current.setSelectionRange(newCursor, newCursor);
+        cursorPos.current = newCursor;
+      }
+    });
+  }
+
+  return (
+    <div className="template-builder">
+      <div className="template-editor">
+        <textarea
+          ref={textareaRef}
+          className="payload-input template-textarea"
+          value={value}
+          onChange={e => { cursorPos.current = e.target.selectionStart; onChange(e.target.value); }}
+          onSelect={e => { cursorPos.current = e.target.selectionStart; }}
+          onBlur={e  => { cursorPos.current = e.target.selectionStart; }}
+          spellCheck="false"
+          style={{ minHeight: 160 }}
+        />
+        <p className="template-hint">Click a canonical field on the right to insert it at your cursor position.</p>
+      </div>
+      <div className="canonical-registry">
+        <p className="canonical-registry-title">Canonical Registry</p>
+        {canonicalFields.length > 0 ? (
+          <select
+            className="canonical-select"
+            onChange={e => {
+              if (e.target.value) { insert(e.target.value); e.target.value = ""; }
+            }}
+          >
+            <option value="">-- Select a field --</option>
+            {canonicalFields.map(cf => (
+              <option key={cf} value={cf}>{cf}</option>
+            ))}
+          </select>
+        ) : (
+          <div className="canonical-empty">No fields available</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function AdapterRegistry({ selectedUser, users, setActiveTab, setSelectedAdapterId }) {
+  const [rawAdapters, setRawAdapters]       = useState([]);
+  const [status, setStatus]                 = useState({ type: "idle", message: "" });
+  const [deleteTarget, setDeleteTarget]     = useState(null);
+  const [deleteStatus, setDeleteStatus]     = useState({ type: "idle", message: "" });
+  const [searchQuery, setSearchQuery]       = useState("");
+  const [filterFormat, setFilterFormat]     = useState("All");
+  const [listenerLoading, setListenerLoading] = useState({});
+  const [runStatusOverride, setRunStatusOverride] = useState({});
+
+  // trigger modal
+  const [triggerPopup, setTriggerPopup]     = useState(false);
+  const [selectedAdapter, setSelectedAdapter] = useState(null);
+  const [payloadText, setPayloadText]       = useState("{\n  \n}");
+  const [triggerStatus, setTriggerStatus]   = useState({ type: "idle", message: "" });
+  const [executionResult, setExecutionResult] = useState(null);
+
+  // configs panel
+  const [configsAdapter, setConfigsAdapter] = useState(null); // adapter whose configs are shown
+  const [addConfigOpen, setAddConfigOpen]   = useState(false);
+  const [newReqName, setNewReqName]         = useState("");
+  const [newTemplate, setNewTemplate]       = useState("{\n  \n}");
+  const [addConfigStatus, setAddConfigStatus] = useState({ type: "idle", message: "" });
+  const [canonicalFields, setCanonicalFields] = useState([]);
+
+  const adapters = useMemo(() => normalizeRows(rawAdapters), [rawAdapters]);
+
+  const formats = useMemo(() => {
+    const set = new Set(adapters.map(a => a.inboundFormat).filter(Boolean));
+    return ["All", ...set];
+  }, [adapters]);
+
+  const displayed = useMemo(() => {
+    let list = adapters;
+    if (filterFormat !== "All") list = list.filter(a => a.inboundFormat === filterFormat);
+    if (searchQuery.trim()) {
+      const q = searchQuery.toLowerCase();
+      list = list.filter(a =>
+        a.adapterName?.toLowerCase().includes(q) ||
+        a.id?.toLowerCase().includes(q) ||
+        a.requestName?.toLowerCase().includes(q)
+      );
+    }
+    return list;
+  }, [adapters, filterFormat, searchQuery]);
+
+  const loadAdapters = useCallback(async () => {
+    if (!selectedUser?.username) { setRawAdapters([]); setStatus({ type: "idle", message: "" }); return; }
+    await cachedFetch(
+      `adapters:${selectedUser.username}`,
+      () => listUserAdapters(selectedUser.username),
+      {
+        onLoading: () => setStatus({ type: "loading", message: "" }),
+        onData: (res) => {
+          setRawAdapters(Array.isArray(res) ? res : []);
+          setRunStatusOverride({});
+          setStatus({ type: "idle", message: "" });
+        },
+        onError: (e) => {
+          setRawAdapters([]);
+          setStatus({ type: "error", message: getApiErrorMessage(e) });
+        },
+      }
+    );
+  }, [selectedUser]);
+
+  useEffect(() => { queueMicrotask(loadAdapters); }, [loadAdapters]);
+
+  // load canonical fields once
+  useEffect(() => {
+    getCanonicalFields().then(f => setCanonicalFields(Array.isArray(f) ? f : [])).catch(() => {});
+  }, []);
+
+  async function toggleListener(adapter) {
+    const currentRun = runStatusOverride[adapter.id] ?? adapter.runStatus;
+    const isRunning  = currentRun === "RUNNING";
+    const action     = isRunning ? "stopping" : "starting";
+    const nextStatus = isRunning ? "STOPPED" : "RUNNING";
+    setListenerLoading(s => ({ ...s, [adapter.id]: action }));
+    setRunStatusOverride(s => ({ ...s, [adapter.id]: nextStatus }));
+    try {
+      if (isRunning) await stopAdapter(adapter.id);
+      else           await startAdapter(adapter.id);
+      invalidateCache(`adapters:${selectedUser?.username}`);
+    } catch (e) {
+      setRunStatusOverride(s => ({ ...s, [adapter.id]: currentRun }));
+      setStatus({ type: "error", message: getApiErrorMessage(e) });
+    } finally {
+      setListenerLoading(s => ({ ...s, [adapter.id]: null }));
+    }
+  }
+
+  function openTrigger(adapter) {
+    setSelectedAdapter(adapter);
+    setPayloadText(JSON.stringify({
+      adapterName: adapter.adapterName || adapter.id,
+      configId: adapter.configId || "",
+      payload: { customerId: "C001", amount: 1000, currency: "INR", transactionId: "TXN-001" },
+      meta: { requestId: `REQ-${Date.now()}`, timestamp: new Date().toISOString() }
+    }, null, 2));
+    setTriggerStatus({ type: "idle", message: "", detail: null });
+    setExecutionResult(null);
+    setTriggerPopup(true);
+  }
+
+  function closeTrigger() {
+    setTriggerPopup(false);
+    setSelectedAdapter(null);
+    setTriggerStatus({ type: "idle", message: "", detail: null });
+    setExecutionResult(null);
+  }
+
+  async function submitTrigger() {
+    let parsed;
+    try { parsed = JSON.parse(payloadText); }
+    catch { setTriggerStatus({ type: "error", message: "Invalid JSON - fix the payload before sending." }); return; }
+    setTriggerStatus({ type: "loading", message: "Sending payload..." });
+    const sentAt = Date.now();
+    const srcFmt = selectedAdapter.inboundFormat || selectedAdapter.sourceFormat || "JSON";
+    const tgtFmt = selectedAdapter.outboundFormat
+      || selectedAdapter.raw?.configurations?.[0]?.targetFormat
+      || selectedAdapter.raw?.targetFormat
+      || srcFmt;
+    const conversion = `${srcFmt} -> ${tgtFmt}`;
+    try {
+      const res = await triggerInboundAdapter(selectedAdapter.id, { payload: parsed });
+      const latency = Date.now() - sentAt;
+      const s = (res?.status ?? "ok").toLowerCase();
+      const isFailed = s === "partial_failure" || s === "failed" || s === "error";
+
+      // Extract matched request name from results[]; never fall back to hardcoded first config.
+      const results = Array.isArray(res?.results) ? res.results : [];
+      const successResult = results.find(r => (r.status ?? "").toLowerCase() === "success") || results[0];
+      const failedResult  = results.find(r => (r.status ?? "").toLowerCase() !== "success") || results[0];
+      const resolvedRequestType =
+        (isFailed ? failedResult : successResult)?.request_name ??
+        (isFailed ? failedResult : successResult)?.requestName ??
+        res?.requestType ?? res?.matchedRule ?? res?.requestName ??
+        res?.inbound?.requestName ?? "-";
+
+      if (isFailed) {
+        const reason = failedResult?.error || res?.error || res?.reason || res?.message || res?.details
+          || res?.outboundResponse?.error || res?.outboundResponse?.message || `Trigger ${res?.status}`;
+        setExecutionResult({
+          adapterName:  selectedAdapter.adapterName || selectedAdapter.id,
+          requestType:  resolvedRequestType,
+          status:       "Failed",
+          conversion,
+          latency_ms:   res?.latency_ms ?? res?.processingTime ?? (Date.now() - sentAt),
+          errorMessage: reason,
+        });
+        setTriggerStatus({ type: "idle", message: "" });
+      } else {
+        invalidateCache(`adapters:${selectedUser?.username}`);
+        setExecutionResult({
+          adapterName:  selectedAdapter.adapterName || selectedAdapter.id,
+          adapterId:    selectedAdapter.id,
+          requestType:  resolvedRequestType,
+          status:       "Success",
+          conversion,
+          latency_ms:   res?.latency_ms ?? res?.processingTime ?? latency,
+          outbound:     res?.outboundResponse?.status || res?.outbound?.status || "-",
+          raw:          res,
+        });
+        setTriggerStatus({ type: "success", message: "" });
+      }
+    } catch (e) {
+      setExecutionResult({
+        adapterName:  selectedAdapter.adapterName || selectedAdapter.id,
+        requestType:  "-",
+        status:       "Failed",
+        conversion,
+        latency_ms:   Date.now() - sentAt,
+        errorMessage: getApiErrorMessage(e),
+      });
+      setTriggerStatus({ type: "idle", message: "" });
+    }
+  }
+
+  // configs panel
+  function openConfigs(adapter) {
+    setConfigsAdapter(adapter);
+    setAddConfigOpen(false);
+    setNewReqName("");
+    setNewTemplate("{\n  \n}");
+    setAddConfigStatus({ type: "idle", message: "" });
+  }
+
+  function openAddConfig() {
+    setNewReqName("");
+    setNewTemplate("{\n  \n}");
+    setAddConfigStatus({ type: "idle", message: "" });
+    setAddConfigOpen(true);
+  }
+
+  async function saveNewConfig() {
+    const label = newReqName.trim();
+    if (!label) { setAddConfigStatus({ type: "error", message: "Request name is required." }); return; }
+    let parsed;
+    try { parsed = JSON.parse(newTemplate); }
+    catch { setAddConfigStatus({ type: "error", message: "Invalid JSON - check for missing quotes or trailing commas." }); return; }
+    const keys = Object.keys(parsed).filter(k => k.trim());
+    if (keys.length === 0) { setAddConfigStatus({ type: "error", message: "Add at least one canonical field before saving." }); return; }
+
+    setAddConfigStatus({ type: "loading", message: "Saving..." });
+    try {
+      const fmt = configsAdapter.inboundFormat || "JSON";
+      const outFmt = configsAdapter.raw?.configurations?.[0]?.targetFormat || fmt;
+      await upsertInboundConfiguration(configsAdapter.id, null, {
+        configId:         `${fmt}_TO_${outFmt}_${label.toUpperCase().replace(/\s+/g, "_")}`,
+        type:             fmt,
+        requestName:      label,
+        sourceFormat:     fmt,
+        targetFormat:     outFmt,
+        transformType:    `${fmt}_TO_${outFmt}`,
+        canonicalMapping: parsed,
+        routingRules:     { required_fields: keys },
+      });
+      invalidateCache(`adapters:${selectedUser?.username}`);
+      await loadAdapters();
+      // refresh configsAdapter from updated raw list
+      setAddConfigOpen(false);
+      setAddConfigStatus({ type: "idle", message: "" });
+      // update configsAdapter with fresh raw data
+      setConfigsAdapter(prev => {
+        const fresh = rawAdapters.find(a => {
+          const id = a.adapterId || a.id || a._id;
+          return String(id) === String(prev.id);
+        });
+        return fresh ? { ...prev, raw: fresh } : prev;
+      });
+    } catch (e) {
+      setAddConfigStatus({ type: "error", message: getApiErrorMessage(e) });
+    }
+  }
+
+  async function confirmDelete() {
+    if (!deleteTarget) return;
+    setDeleteStatus({ type: "loading", message: "Deleting..." });
+    try {
+      await deleteAdapterConfiguration(deleteTarget.id);
+      invalidateCache(`adapters:${selectedUser?.username}`);
+      setDeleteTarget(null);
+      setDeleteStatus({ type: "idle", message: "" });
+      loadAdapters();
+    } catch (e) {
+      setDeleteStatus({ type: "error", message: getApiErrorMessage(e) });
+    }
+  }
+
+  // get configs list from raw adapter
+  const configsList = useMemo(() => {
+    if (!configsAdapter) return [];
+    const raw = configsAdapter.raw;
+    return Array.isArray(raw?.configurations) ? raw.configurations : [];
+  }, [configsAdapter, rawAdapters]);
+
+  return (
+    <div className="registry-layout">
+
+      <div className="ar-page-header">
+        <div>
+          <h2 className="ar-page-title">Created Adapters</h2>
+          <p className="ar-page-sub">Manage always-on background listeners and transformation routes.</p>
+        </div>
+        <button className="btn-primary ar-new-btn" onClick={() => setActiveTab("config")}>
+          <i className="ti ti-plus" /> New Adapter
+        </button>
+      </div>
+
+      {status.message && status.type === "error" && (
+        <p className="status error">{status.message}</p>
+      )}
+
+      <div className="ar-card">
+        <div className="ar-toolbar">
+          <div className="ar-filter-tabs">
+            {formats.map(f => (
+              <button key={f} className={`ar-filter-tab ${filterFormat === f ? "active" : ""}`}
+                onClick={() => setFilterFormat(f)}>{f}</button>
+            ))}
+          </div>
+          <div className="ar-search">
+            <i className="ti ti-search" />
+            <input type="text" placeholder="Search by adapter name or ID..."
+              value={searchQuery} onChange={e => setSearchQuery(e.target.value)} />
+          </div>
+          <button className="btn-ghost ar-refresh-btn" onClick={loadAdapters} disabled={!selectedUser}>
+            <i className="ti ti-refresh" />
+          </button>
+        </div>
+
+        <div className="data-table-wrap">
+          <table className="data-table ar-table">
+            <thead>
+              <tr>
+                <th>Adapter / ID</th>
+                <th>Listener</th>
+                <th>Format Type</th>
+                <th>Outbound Transform</th>
+                <th>Created On</th>
+                <th style={{ textAlign: "right" }}>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {status.type === "loading" && Array.from({ length: 5 }).map((_, i) => (
+                <tr key={i} className="ar-row">
+                  <td><div className="ar-name-cell"><div className="skel" style={{ width: 38, height: 38, borderRadius: 8, flexShrink: 0 }} /><div className="skel-body"><div className="skel skel-h" style={{ width: 120 }} /><div className="skel skel-s" style={{ width: 80 }} /></div></div></td>
+                  <td><div className="skel" style={{ width: 80, height: 22, borderRadius: 999 }} /></td>
+                  <td><div className="skel skel-h" style={{ width: 60 }} /></td>
+                  <td><div className="skel" style={{ width: 100, height: 20, borderRadius: 4 }} /></td>
+                  <td><div className="skel skel-h" style={{ width: 80 }} /></td>
+                  <td><div className="skel" style={{ width: 160, height: 30, borderRadius: 6, marginLeft: "auto" }} /></td>
+                </tr>
+              ))}
+              {status.type !== "loading" && displayed.map(adapter => {
+                const created    = formatDate(adapter.createdOn);
+                const currentRun = runStatusOverride[adapter.id] ?? adapter.runStatus;
+                const isRunning  = currentRun === "RUNNING";
+                const loading    = listenerLoading[adapter.id];
+                const cfgCount   = Array.isArray(adapter.raw?.configurations) ? adapter.raw.configurations.length : 0;
+
+                return (
+                  <tr key={adapter.id} className="ar-row">
+                    <td>
+                      <div className="ar-name-cell">
+                        <AdapterIcon status={adapter.status} />
+                        <div>
+                          <strong>{adapter.adapterName || adapter.id}</strong>
+                          <span className="ar-id">{adapter.id}</span>
+                        </div>
+                      </div>
+                    </td>
+                    <td><RunStatusBadge runStatus={currentRun} /></td>
+                    <td><strong>{adapter.inboundFormat || "-"}</strong></td>
+                    <td>
+                      <div className="ar-route">
+                        <span className="ar-route-pill">{adapter.inboundFormat || "-"}</span>
+                        <i className="ti ti-arrow-right" style={{ fontSize: 11, color: "var(--muted)" }} />
+                        <span className="ar-route-pill">{adapter.outboundFormat || "-"}</span>
+                      </div>
+                      <span className="ar-transform">{adapter.transformType || "-"}</span>
+                    </td>
+                    <td>
+                      {created ? <><strong>{created.date}</strong><span>{created.time}</span></> : <span>-</span>}
+                    </td>
+                    <td>
+                      <div className="ar-actions">
+                        <button className="ar-icon-btn" title="Analytics & Details" style={{ opacity: 1, color: "var(--primary)" }}
+                          onClick={() => { setSelectedAdapterId(adapter.id); setActiveTab("adapter_details"); }}>
+                          <i className="ti ti-chart-bar" />
+                        </button>
+                        <button className="ar-icon-btn ar-icon-btn-danger" title="Delete"
+                          onClick={() => { setDeleteTarget(adapter); setDeleteStatus({ type: "idle", message: "" }); }}>
+                          <i className="ti ti-trash" />
+                        </button>
+                        <button className="btn-listener btn-listener-configs" onClick={() => openConfigs(adapter)}>
+                          <i className="ti ti-list-details" /> Configs {cfgCount > 0 && <span className="cfg-badge">{cfgCount}</span>}
+                        </button>
+                        <button
+                          className={`btn-listener ${isRunning ? "btn-listener-stop" : "btn-listener-start"}`}
+                          disabled={!!loading} onClick={() => toggleListener(adapter)}>
+                          {loading === "starting" && <><i className="ti ti-loader-2 spin" /> Starting...</>}
+                          {loading === "stopping" && <><i className="ti ti-loader-2 spin" /> Stopping...</>}
+                          {!loading && isRunning  && <><i className="ti ti-player-stop" /> Stop</>}
+                          {!loading && !isRunning && <><i className="ti ti-player-play" /> Start</>}
+                        </button>
+                        <button className="btn-listener btn-listener-test" onClick={() => openTrigger(adapter)}>
+                          <i className="ti ti-send" /> Test
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })}
+              {status.type !== "loading" && displayed.length === 0 && (
+                <tr>
+                  <td colSpan="6" className="empty-cell" style={{ padding: "32px" }}>
+                    {!selectedUser ? "Select a user to view their adapters." : "No adapters found."}
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+
+        <div className="ar-footer">
+          <span>Showing {displayed.length} of {adapters.length} adapters</span>
+          <span>
+            <span className="run-dot run-dot-pulse" style={{ display: "inline-block", marginRight: 5 }} />
+            {adapters.filter(a => (runStatusOverride[a.id] ?? a.runStatus) === "RUNNING").length} running
+          </span>
+        </div>
+      </div>
+
+      {/* Configs Panel Modal */}
+      {configsAdapter && (
+        <div className="modal-backdrop" onClick={e => { if (e.target === e.currentTarget) { setConfigsAdapter(null); setAddConfigOpen(false); } }}>
+          <div className="status-modal" style={{ width: "min(720px, 96vw)", maxHeight: "90vh", gap: 0, padding: 0, overflow: "hidden" }}>
+
+            {/* header */}
+            <div style={{ padding: "18px 22px", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+              <div>
+                <p style={{ margin: 0, fontSize: 10, fontWeight: 700, letterSpacing: "0.07em", textTransform: "uppercase", color: "var(--primary)" }}>Request Types</p>
+                <h2 style={{ margin: "2px 0 0", fontSize: 16, fontWeight: 700, color: "var(--heading)" }}>{configsAdapter.adapterName || configsAdapter.id}</h2>
+              </div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button className="btn-primary" style={{ fontSize: 12, padding: "7px 14px" }} onClick={openAddConfig}>
+                  <i className="ti ti-plus" /> Add Request Type
+                </button>
+                <button className="ar-icon-btn" style={{ opacity: 1 }} onClick={() => { setConfigsAdapter(null); setAddConfigOpen(false); }}>
+                  <i className="ti ti-x" />
+                </button>
+              </div>
+            </div>
+
+            {/* configs list */}
+            <div style={{ overflowY: "auto", maxHeight: addConfigOpen ? "30vh" : "60vh" }}>
+              {configsList.length === 0 ? (
+                <p style={{ padding: "24px", textAlign: "center", color: "var(--muted)", fontSize: 13 }}>No request types configured yet.</p>
+              ) : (
+                <table className="data-table" style={{ minWidth: "unset" }}>
+                  <thead>
+                    <tr>
+                      <th>Request Name</th>
+                      <th>Config ID</th>
+                      <th>Transform</th>
+                      <th>Fields</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {configsList.map((cfg, i) => {
+                      const fields = cfg.canonicalMapping ? Object.keys(cfg.canonicalMapping) : [];
+                      return (
+                        <tr key={cfg.configId || i}>
+                          <td><strong>{cfg.requestName || "-"}</strong></td>
+                          <td><span style={{ fontFamily: "ui-monospace, monospace", fontSize: 11, color: "var(--muted)" }}>{cfg.configId || "-"}</span></td>
+                          <td><span className="ar-route-pill">{cfg.transformType || "-"}</span></td>
+                          <td>
+                            <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+                              {fields.length > 0
+                                ? fields.map(f => <code key={f} className="rule-field-chip">{f}</code>)
+                                : <span style={{ color: "var(--muted)", fontSize: 12 }}>-</span>}
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              )}
+            </div>
+
+            {/* add config form */}
+            {addConfigOpen && (
+              <div style={{ borderTop: "1px solid var(--border)", padding: "18px 22px", display: "flex", flexDirection: "column", gap: 12 }}>
+                <p style={{ margin: 0, fontSize: 11, fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase", color: "var(--primary)" }}>New Request Type</p>
+                <div className="field">
+                  <label>Request Name</label>
+                  <input type="text" value={newReqName} onChange={e => setNewReqName(e.target.value)}
+                    placeholder="e.g. STATEMENT_ENQUIRY" />
+                </div>
+                <TemplateBuilder value={newTemplate} onChange={setNewTemplate} canonicalFields={canonicalFields} />
+                {addConfigStatus.message && (
+                  <p className={`status ${addConfigStatus.type}`} style={{ margin: 0 }}>{addConfigStatus.message}</p>
+                )}
+                <div className="form-actions" style={{ paddingTop: 0 }}>
+                  <button className="btn-ghost" onClick={() => setAddConfigOpen(false)} disabled={addConfigStatus.type === "loading"}>Cancel</button>
+                  <button className="btn-primary" onClick={saveNewConfig} disabled={addConfigStatus.type === "loading"}>
+                    {addConfigStatus.type === "loading" ? <><i className="ti ti-loader-2 spin" /> Saving...</> : "Save Request Type"}
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Delete Modal */}
+      {deleteTarget && (
+        <div className="modal-backdrop">
+          <div className="status-modal">
+            <div className="status-modal-mark error">!</div>
+            <h2>Delete adapter?</h2>
+            <p>{deleteTarget.adapterName || deleteTarget.id} will be removed. No data is lost.</p>
+            {deleteStatus.message && <p className={`status ${deleteStatus.type}`}>{deleteStatus.message}</p>}
+            <div className="form-actions">
+              <button className="btn-ghost" onClick={() => setDeleteTarget(null)} disabled={deleteStatus.type === "loading"}>Cancel</button>
+              <button className="btn-danger" onClick={confirmDelete} disabled={deleteStatus.type === "loading"}>
+                {deleteStatus.type === "loading" ? "Deleting..." : "Confirm delete"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Manual Test Modal */}
+      {triggerPopup && selectedAdapter && (
+        <div className="modal-backdrop">
+          <div className="status-modal" style={{ width: "min(560px, 100%)", gap: 14 }}>
+
+            {/* Execution Summary */}
+            {executionResult ? (
+              <>
+                <div className="exec-summary">
+                  <div className={`exec-summary-icon ${executionResult.status === "Failed" ? "exec-summary-icon-failed" : ""}`}>
+                    <i className={`ti ${executionResult.status === "Failed" ? "ti-circle-x" : "ti-circle-check"}`} />
+                  </div>
+                  <p className="exec-summary-label">Execution Complete</p>
+                  <h2 className="exec-summary-title" style={executionResult.status === "Failed" ? { color: "var(--danger)" } : {}}>
+                    {executionResult.status === "Failed" ? "Failed" : "Success"}
+                  </h2>
+                </div>
+                <div className="exec-summary-grid">
+                  <div className="exec-summary-item">
+                    <span><i className="ti ti-plug-connected" /> Adapter</span>
+                    <strong>{executionResult.adapterName}</strong>
+                  </div>
+                  <div className="exec-summary-item">
+                    <span><i className="ti ti-tag" /> Request Type Matched</span>
+                    <strong>{executionResult.requestType}</strong>
+                  </div>
+                  <div className="exec-summary-item">
+                    <span><i className="ti ti-clock" /> Processing Time</span>
+                    <strong>{executionResult.latency_ms} ms</strong>
+                  </div>
+                  <div className="exec-summary-item">
+                    <span><i className="ti ti-arrows-exchange" /> Format</span>
+                    <strong>{executionResult.conversion}</strong>
+                  </div>
+                  {executionResult.status !== "Failed" && (
+                    <div className="exec-summary-item">
+                      <span><i className="ti ti-send" /> Outbound Status</span>
+                      <strong>{executionResult.outbound}</strong>
+                    </div>
+                  )}
+                </div>
+                {executionResult.status === "Failed" && (
+                  <div style={{
+                    padding: "10px 14px", borderRadius: 7, fontSize: 13,
+                    background: "rgba(220,38,38,0.07)", border: "1px solid rgba(220,38,38,0.25)",
+                    color: "var(--danger)",
+                  }}>
+                    <strong>Reason:</strong> {executionResult.errorMessage}
+                  </div>
+                )}
+                <div className="form-actions" style={{ paddingTop: 4 }}>
+                  <button className="btn-ghost" onClick={closeTrigger}>Back to Registry</button>
+                  <button className="btn-primary" onClick={() => setExecutionResult(null)}>
+                    <i className="ti ti-refresh" /> Trigger Another
+                  </button>
+                </div>
+              </>
+            ) : (
+              /* Payload Editor */
+              <>
+                <div className="status-modal-mark success"><i className="ti ti-send" style={{ fontSize: 18 }} /></div>
+                <h2>Manual Test - {selectedAdapter.adapterName || selectedAdapter.id}</h2>
+                <p style={{ fontSize: 12, color: "var(--muted)", margin: 0 }}>Paste a JSON payload to trigger this adapter directly.</p>
+                <textarea
+                  style={{
+                    width: "100%", minHeight: 180, fontFamily: "ui-monospace, monospace",
+                    fontSize: 12, lineHeight: 1.6, padding: "10px 12px",
+                    border: "1px solid var(--border)", borderRadius: 7,
+                    background: "var(--panel-soft)", color: "var(--heading)", resize: "vertical",
+                  }}
+                  value={payloadText}
+                  onChange={e => setPayloadText(e.target.value)}
+                  spellCheck="false"
+                />
+                {triggerStatus.message && (
+                  <p className={`status ${triggerStatus.type}`} style={{ margin: 0 }}>{triggerStatus.message}</p>
+                )}
+                {triggerStatus.detail && (
+                  <pre style={{
+                    margin: 0, padding: "10px 12px", borderRadius: 7, fontSize: 11,
+                    background: "var(--panel-soft)", border: "1px solid var(--border)",
+                    color: "var(--text)", fontFamily: "ui-monospace, monospace",
+                    maxHeight: 180, overflowY: "auto", whiteSpace: "pre-wrap", wordBreak: "break-all",
+                  }}>{triggerStatus.detail}</pre>
+                )}
+                <div className="form-actions">
+                  <button className="btn-ghost" onClick={closeTrigger} disabled={triggerStatus.type === "loading"}>Cancel</button>
+                  <button className="btn-primary" onClick={submitTrigger} disabled={triggerStatus.type === "loading"}>
+                    {triggerStatus.type === "loading" ? <><i className="ti ti-loader-2 spin" /> Sending...</> : <><i className="ti ti-send" /> Send Payload</>}
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default AdapterRegistry;
+

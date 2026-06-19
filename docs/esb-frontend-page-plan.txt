@@ -1,0 +1,266 @@
+ESB Frontend Page Plan
+
+Core product flow
+
+The user should not repeatedly configure the same ESB details. A real ESB frontend should separate stable configuration from repeat execution.
+
+Primary workflow:
+1. Create outbound destination adapter.
+2. Create inbound adapter.
+3. Add one or more inbound conversion configurations.
+4. Link inbound conversion configuration to outbound destination.
+5. Save the linked setup.
+6. Recall saved setup later.
+7. Trigger with only a new payload or batch files.
+8. Review transform, route, and delivery results.
+
+Page 1: Dashboard
+
+Purpose:
+- show real API-backed overview only
+- no dummy cards or fake metrics
+
+Data:
+- GET /api/inbound-adapters
+- GET /api/outbound-adapters
+
+UI:
+- count of inbound adapters from API
+- count of outbound adapters from API
+- quick actions:
+  - New linked flow
+  - Inbound adapters
+  - Outbound adapters
+  - Trigger payload
+
+Page 2: Linked Flow Builder
+
+Purpose:
+- main setup page for creating inbound + outbound together
+- this is the cleanest path for users who want one reusable client configuration
+
+API:
+- POST /api/adapter-configurations
+- PUT /api/adapter-configurations/:adapterId
+- PATCH /api/adapter-configurations/:adapterId
+
+Sections:
+- Flow identity
+  - adapterId
+  - adapterName
+  - requestName
+- Inbound settings
+  - type
+  - requestBody
+  - conversionLimit
+- Conversion configuration
+  - configId
+  - sourceFormat
+  - targetFormat
+  - transformType
+- Outbound destination
+  - outboundId
+  - name
+  - protocol
+  - host
+  - port
+  - path
+  - method
+  - format
+  - timeoutSeconds
+  - retryCount
+  - sendEnabled
+  - headers
+
+Behavior:
+- save one linked inbound/outbound config
+- allow editing an existing linked config
+- do not ask user to re-enter this when triggering payload later
+
+Page 3: Inbound Adapters
+
+Purpose:
+- manage inbound adapters independently when required
+
+API:
+- GET /api/inbound-adapters
+- GET /api/inbound-adapters/:adapterId
+- POST /api/inbound-adapters
+- PUT /api/inbound-adapters/:adapterId
+- PATCH /api/inbound-adapters/:adapterId
+
+UI:
+- left list of inbound adapters
+- right detail editor
+- nested configurations table
+- action to add/update one configuration
+
+Page 4: Inbound Configuration Editor
+
+Purpose:
+- manage one config under an inbound adapter
+
+API:
+- POST /api/inbound-adapters/:adapterId/configurations
+- PUT /api/inbound-adapters/:adapterId/configurations/:configId
+- PATCH /api/inbound-adapters/:adapterId/configurations/:configId
+
+Fields:
+- configId
+- type
+- requestName
+- sourceFormat
+- targetFormat
+- transformType
+- outboundId
+
+Behavior:
+- outboundId should be selected from real outbound adapters
+- this is where inbound becomes linked to outbound
+
+Page 5: Outbound Adapters
+
+Purpose:
+- manage reusable destinations independently
+
+API:
+- GET /api/outbound-adapters
+- GET /api/outbound-adapters/:outboundId
+- POST /api/outbound-adapters
+- PUT /api/outbound-adapters/:outboundId
+- PATCH /api/outbound-adapters/:outboundId
+
+Fields:
+- outboundId
+- name
+- protocol
+- host
+- port
+- path
+- method
+- format
+- timeoutSeconds
+- retryCount
+- sendEnabled
+- headers
+
+Notes:
+- protocol values: HTTP, HTTPS, TCP, FILE, DATABASE
+- format values: JSON, XML, ISO8583, ISO20022
+
+Page 6: Trigger Payload
+
+Purpose:
+- recall saved inbound adapter/configuration
+- submit only changing payload or batch files
+
+API:
+- POST /api/inbound-adapters/:adapterId/trigger
+
+UI:
+- select adapter from GET /api/inbound-adapters
+- select configId from selected adapter configurations
+- payload JSON editor
+- meta JSON editor
+- batch mode toggle
+- submit button
+- response panel
+
+Behavior:
+- user should not edit adapter settings here
+- payload is the only required changing input
+
+Page 7: Transform Lab
+
+Purpose:
+- let user test transformation before saving or triggering full routing
+
+API:
+- POST /api/v1/esb/transform
+- POST /api/canonical/suggest
+- POST /api/request-type/resolve
+- POST /api/validate-custom-function
+
+UI:
+- request type selector
+- inboundType
+- outboundType
+- payload editor
+- mapping editor
+- transform functions editor
+- result preview
+
+Notes:
+- for ISO8583 and ISO20022, strict protocol parsing can use empty mapping and transformFunctions
+
+Page 8: Execute Output Lab
+
+Purpose:
+- convert canonical data into final target output without routing through an adapter
+
+API:
+- POST /api/v1/esb/execute
+
+UI:
+- inboundType
+- outboundType
+- payload editor
+- meta editor
+- xmlConfig
+- iso8583Config
+- result preview
+
+Page 9: Request Types
+
+Purpose:
+- support dropdowns and contract inspection
+
+API:
+- GET /api/request-type/list
+- GET /api/request-type/list?format=iso8583
+- GET /api/request-type/list?format=iso20022
+- GET /api/request-type/contract/:requestType
+
+UI:
+- list request types
+- filter by format
+- show selected contract schema and protocol metadata
+
+Page 10: File Upload
+
+Purpose:
+- upload CSV, text, or SQLite input for transformation flows
+
+API:
+- POST /api/v1/esb/upload
+
+UI:
+- file picker
+- format selector: file or database
+- upload result preview
+
+Recommended build order
+
+1. Replace current API service with exact active endpoints.
+2. Build Dashboard using only GET /api/inbound-adapters and GET /api/outbound-adapters.
+3. Build Outbound Adapters page first because inbound configs need outboundId.
+4. Build Inbound Adapters page with nested configurations.
+5. Build Linked Flow Builder for one-call create/update.
+6. Build Trigger Payload page.
+7. Add Transform Lab and Execute Output Lab.
+8. Add Request Types and File Upload support.
+
+Real ESB shape
+
+A real ESB UI is not just inbound and outbound menus. It usually has:
+- reusable adapters
+- reusable destinations
+- transformation mappings
+- protocol-specific configuration
+- route linking
+- trigger or replay screen
+- observability for transform status, routing status, delivery status, and errors
+- tools for testing transform and final output before production routing
+
+For this project, the clean center is:
+Adapter configuration is stable. Payload changes per run.
