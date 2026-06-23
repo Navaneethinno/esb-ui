@@ -505,7 +505,7 @@ function normalizeLog(row) {
   };
 }
 
-export default function SummaryDashboard({ selectedUser, selectedUsername, workspaceId, activeTab }) {
+export default function SummaryDashboard({ selectedUser, selectedUsername, workspaceId, activeTab, setActiveTab }) {
   const [rawAdapters, setRawAdapters] = useState([]);
   const [metrics, setMetrics] = useState(null);
   const [logs, setLogs] = useState([]);
@@ -798,14 +798,14 @@ export default function SummaryDashboard({ selectedUser, selectedUsername, works
               label="Configured Adapters"
               value={configuredAdapters}
               tone="success"
-              onClick={() => setInventoryModal({ type: "adapters", title: "Configured Adapters", items: safeArray(rawAdapters) })}
+              onClick={() => setActiveTab?.("adapters")}
             />
             <KPICard
               icon={<i className="ti ti-link" />}
               label="Linked Routes"
               value={linkedRoutes}
               tone="route"
-              onClick={() => setInventoryModal({ type: "routes", title: "Linked Routes", items: safeArray(linkedRouteRows) })}
+              onClick={() => setActiveTab?.("linked_routes")}
             />
             <KPICard
               icon={<i className="ti ti-activity" />}

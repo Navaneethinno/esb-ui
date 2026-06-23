@@ -9,9 +9,9 @@
 export const TABLE_THEME = {
   // ── Layout & Spacing ──
   layout: {
-    rowHeight: 88,
-    headerHeight: 56,
-    toolbarHeight: 64,
+    rowHeight: 74,
+    headerHeight: 48,
+    toolbarHeight: 44,
     borderRadius: 12,
     containerBorderRadius: 8,
     gap: 16,
@@ -19,10 +19,10 @@ export const TABLE_THEME = {
 
   // ── Cell Padding ──
   padding: {
-    cellX: 16,
+    cellX: 14,
     cellY: 0,
-    toolbarX: 20,
-    toolbarY: 14,
+    toolbarX: 10,
+    toolbarY: 8,
   },
 
   // ── Typography ──
@@ -63,10 +63,10 @@ export const TABLE_THEME = {
 
   // ── Badges ──
   badges: {
-    height: 38,
-    minWidth: 138,
-    paddingX: 14,
-    fontSize: 12,
+    height: 34,
+    minWidth: 120,
+    paddingX: 12,
+    fontSize: 11,
     fontWeight: 800,
     borderRadius: 999,
     borderWidth: 1,
@@ -74,10 +74,10 @@ export const TABLE_THEME = {
 
   // ── Pills ──
   pills: {
-    height: 56,
-    minWidth: 110,
-    paddingX: 16,
-    fontSize: 12,
+    height: 44,
+    minWidth: 100,
+    paddingX: 14,
+    fontSize: 11,
     fontWeight: 800,
     borderRadius: 999,
     labelSize: 10,
@@ -87,8 +87,8 @@ export const TABLE_THEME = {
 
   // ── Action Buttons ──
   buttons: {
-    height: 38,
-    width: 170,
+    height: 34,
+    width: 158,
     fontSize: 11,
     fontWeight: 600,
     borderRadius: 7,
@@ -98,8 +98,8 @@ export const TABLE_THEME = {
 
   // ── Toolbar Controls ──
   controls: {
-    height: 40,
-    fontSize: 13,
+    height: 36,
+    fontSize: 12,
     fontWeight: 700,
     borderRadius: 7,
     paddingX: 14,

@@ -173,8 +173,8 @@
   position: sticky;
   top: 0;
   z-index: 2;
-  height: 56px;
-  padding: 0 16px;
+  height: 48px;
+  padding: 0 14px;
   border-bottom: 1px solid #e7dfd2;
   background: #fbfaf8;
   color: #5f6875;
@@ -207,8 +207,8 @@
 
 /* ── Cells - Responsive ── */
 .dt-table td {
-  height: 88px;
-  padding: 0 16px;
+  height: 74px;
+  padding: 0 14px;
   border-bottom: 1px solid #e9e0d3;
   color: var(--text);
   vertical-align: middle;

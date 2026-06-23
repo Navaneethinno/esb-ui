@@ -542,8 +542,8 @@ export default function AuditDashboard({ selectedUser }) {
   }, [linkedMappings, selectedLog]);
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-      <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 18, flexWrap: "wrap" }}>
+    <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+      <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 14, flexWrap: "wrap" }}>
         <div>
           <h2 style={{ margin: 0, fontSize: 26, fontWeight: 900, color: "var(--heading)" }}>Audit Logs</h2>
         </div>
@@ -554,15 +554,15 @@ export default function AuditDashboard({ selectedUser }) {
         </div>
       </div>
 
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 12, padding: 16, border: "1px solid var(--border)", borderRadius: 18, background: "var(--panel-soft)" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "0 12px", border: "1px solid var(--border)", borderRadius: 12, background: "var(--panel)" }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 10, padding: 10, border: "1px solid var(--border)", borderRadius: 18, background: "var(--panel-soft)" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "0 10px", border: "1px solid var(--border)", borderRadius: 12, background: "var(--panel)" }}>
           <i className="ti ti-search" style={{ color: "var(--muted)" }} />
           <input
             type="text"
             value={search}
             onChange={(event) => setSearch(event.target.value)}
             placeholder="Search request ID, mapping ID, adapter, request type"
-            style={{ width: "100%", border: "none", background: "transparent", outline: "none", padding: "12px 0", color: "var(--heading)", fontSize: 12 }}
+            style={{ width: "100%", border: "none", background: "transparent", outline: "none", padding: "10px 0", color: "var(--heading)", fontSize: 12 }}
           />
         </div>
 
@@ -577,7 +577,7 @@ export default function AuditDashboard({ selectedUser }) {
         <input type="date" value={fromDate} onChange={(event) => setFromDate(event.target.value)} style={filterControlStyle} />
         <input type="date" value={toDate} onChange={(event) => setToDate(event.target.value)} style={filterControlStyle} />
 
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, padding: "0 12px", border: "1px solid var(--border)", borderRadius: 12, background: "var(--panel)", fontSize: 12, color: "var(--muted)" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, padding: "0 10px", border: "1px solid var(--border)", borderRadius: 12, background: "var(--panel)", fontSize: 12, color: "var(--muted)" }}>
           <span>{filteredLogs.length} records</span>
           <span>Page {currentPage} / {pageCount}</span>
         </div>
@@ -587,11 +587,11 @@ export default function AuditDashboard({ selectedUser }) {
 
       <div style={{ border: "1px solid var(--border)", borderRadius: 20, background: "var(--panel)", overflow: "hidden", boxShadow: "0 18px 48px rgba(15,23,42,0.08)" }}>
         {loading ? (
-          <div style={{ padding: 20, display: "grid", gap: 12 }}>
+          <div style={{ padding: 16, display: "grid", gap: 10 }}>
             {Array.from({ length: 8 }).map((_, index) => <div key={index} className="skel" style={{ height: 58, borderRadius: 12 }} />)}
           </div>
         ) : filteredLogs.length === 0 ? (
-          <div style={{ padding: "56px 24px", textAlign: "center" }}>
+          <div style={{ padding: "44px 20px", textAlign: "center" }}>
             <i className="ti ti-clipboard-off" style={{ display: "block", fontSize: 40, color: "var(--border)", marginBottom: 10 }} />
             <p style={{ margin: 0, color: "var(--muted)", fontSize: 13 }}>No enriched adapter link audit records match the current filters.</p>
           </div>
@@ -676,7 +676,7 @@ export default function AuditDashboard({ selectedUser }) {
               </table>
             </div>
 
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, padding: 16, borderTop: "1px solid var(--border)", background: "var(--panel-soft)", flexWrap: "wrap" }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, padding: "10px 14px", borderTop: "1px solid var(--border)", background: "var(--panel-soft)", flexWrap: "wrap" }}>
               <span style={{ fontSize: 12, color: "var(--muted)" }}>
                 Showing {(currentPage - 1) * PAGE_SIZE + 1}-{Math.min(currentPage * PAGE_SIZE, filteredLogs.length)} of {filteredLogs.length}
               </span>

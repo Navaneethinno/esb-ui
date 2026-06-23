@@ -1,5 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
+﻿import { useEffect, useMemo, useState } from "react";
 import { PageHeader } from "../components/shared/PageHeader";
+import { DataTableContainer, TablePagination, useTableQuery } from "../components/shared/DataTable";
+import { PageToolbar } from "../components/shared/PageToolbar";
 import { getApiErrorMessage, createFee, deleteFee, getFee, getFeeUsage, getFees, updateFee } from "../services/esbApi";
 import { invalidateCachePrefix } from "../utils/apiCache";
 
@@ -29,9 +31,9 @@ function isFormValid(f, touched) {
 }
 
 function formatDateTime(value) {
-  if (!value) return "—";
+  if (!value) return "â€”";
   const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return "—";
+  if (Number.isNaN(date.getTime())) return "â€”";
   return new Intl.DateTimeFormat("en-GB", {
     day: "2-digit",
     month: "short",
@@ -43,9 +45,9 @@ function formatDateTime(value) {
 }
 
 function formatShortTime(value) {
-  if (!value) return "—";
+  if (!value) return "â€”";
   const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return "—";
+  if (Number.isNaN(date.getTime())) return "â€”";
   return new Intl.DateTimeFormat("en-GB", {
     hour: "2-digit",
     minute: "2-digit",
@@ -76,7 +78,30 @@ function formatFeeValue(fee) {
   if (fee.calcType === "PERCENTAGE") {
     return `${fee.percentage ?? 0}%`;
   }
-  return `₹${fee.amount ?? 0}`;
+  return `â‚¹${fee.amount ?? 0}`;
+}
+
+function buildFeeActions(fee, onEdit, onDelete) {
+  return (
+    <div style={{ display: "flex", gap: 4 }}>
+      <button
+        type="button"
+        className="ar-icon-btn"
+        onClick={(e) => { e.stopPropagation(); onEdit(fee, e); }}
+        title="Edit"
+      >
+        <i className="ti ti-edit" />
+      </button>
+      <button
+        type="button"
+        className="ar-icon-btn ar-icon-btn-danger"
+        onClick={(e) => { e.stopPropagation(); onDelete(fee, e); }}
+        title="Delete"
+      >
+        <i className="ti ti-trash" />
+      </button>
+    </div>
+  );
 }
 
 export default function FeesPage({ selectedUsername }) {
@@ -135,7 +160,7 @@ export default function FeesPage({ selectedUsername }) {
     setFormData({
       feeName: fee.feeName || "",
       feeType: fee.feeType || "FLAT",
-      calcType: fee.calcType || "FIXED",
+      calcType: fee.calculationType || fee.calcType || fee.feeType || "—",
       amount: fee.amount ?? "",
       percentage: fee.percentage ?? "",
       minFee: fee.minFee ?? "",
@@ -185,11 +210,28 @@ export default function FeesPage({ selectedUsername }) {
     const usage = usageByFeeId[fee.feeId] || fee.usage || fee.analytics || {};
     return {
       ...fee,
+      calculationType: fee.calculationType || fee.calcType || fee.feeType || "—",
+      actions: buildFeeActions(fee, handleEdit, handleDelete),
       totalUsage: usage.totalExecutions ?? usage.totalUsage ?? fee.totalUsage ?? 0,
       totalFeeCollected: usage.totalFeeCollected ?? fee.totalFeeCollected ?? 0,
       lastUsed: usage.lastUsed ?? fee.lastUsed ?? fee.lastUsedAt ?? null,
     };
   }), [fees, usageByFeeId]);
+
+  const tableColumns = useMemo(() => [
+    { field: "feeId", label: "Fee ID", width: "8%", searchFields: ["feeId", "feeCode"] },
+    { field: "feeName", label: "Fee Name", width: "18%", searchFields: ["feeName"] },
+    { field: "feeType", label: "Transaction Type", width: "12%", searchFields: ["feeType"] },
+    { field: "calculationType", label: "Calculation Type", width: "12%", searchFields: ["calculationType", "calcType", "feeType"] },
+    { field: "value", label: "Value", width: "14%", searchFields: ["amount", "percentage", "slabs"] },
+    { field: "createdBy", label: "Created By", width: "10%", searchFields: ["createdBy", "created_by", "username"] },
+    { field: "totalUsage", label: "Usage Count", width: "8%", searchFields: ["totalUsage"] },
+    { field: "lastUsed", label: "Last Used", width: "10%", searchFields: ["lastUsed", "lastUsedAt"] },
+    { field: "actions", label: "Actions", width: "10%" },
+  ], []);
+
+  const tableQuery = useTableQuery(rows, tableColumns, { defaultPageSize: 10 });
+  const pagedFees = tableQuery.pagedRows;
 
   return (
     <div className="content">
@@ -207,18 +249,49 @@ export default function FeesPage({ selectedUsername }) {
         </div>
       )}
 
+      <DataTableContainer
+        toolbar={
+          <PageToolbar
+            refreshAction={{
+              onClick: loadFees,
+              loading,
+              label: "Refresh",
+            }}
+            searchProps={{
+              placeholder: "Search fees...",
+              value: tableQuery.searchText,
+              onChange: tableQuery.setSearchText,
+              onSubmit: tableQuery.applySearch,
+              columns: tableQuery.searchOptions,
+              selectedColumn: tableQuery.searchColumn,
+              onColumnChange: tableQuery.setSearchColumn,
+              buttonLabel: "Search",
+            }}
+          />
+        }
+        pagination={
+          <TablePagination
+            currentPage={tableQuery.currentPage}
+            pageCount={tableQuery.pageCount}
+            totalItems={tableQuery.totalRows}
+            pageSize={tableQuery.pageSize}
+            onPageChange={tableQuery.setCurrentPage}
+            onPageSizeChange={tableQuery.setPageSize}
+          />
+        }
+      >
       <div className="created-table-wrap">
         <table className="created-table">
           <colgroup>
-            <col style={{ width: "12%" }} />
+            <col style={{ width: "8%" }} />
             <col style={{ width: "18%" }} />
             <col style={{ width: "12%" }} />
             <col style={{ width: "12%" }} />
             <col style={{ width: "14%" }} />
-            <col style={{ width: "11%" }} />
-            <col style={{ width: "9%" }} />
             <col style={{ width: "10%" }} />
             <col style={{ width: "8%" }} />
+            <col style={{ width: "10%" }} />
+            <col style={{ width: "10%" }} />
           </colgroup>
           <thead>
             <tr>
@@ -248,40 +321,21 @@ export default function FeesPage({ selectedUsername }) {
               </tr>
             ))}
 
-            {!loading && rows.map((fee) => (
+            {!loading && pagedFees.map((fee) => (
               <tr key={fee.feeId}>
-                <td><span className="created-count-badge" style={{ minWidth: "auto", fontFamily: "monospace" }}>{fee.feeId || fee.feeCode || "—"}</span></td>
-                <td><strong>{fee.feeName || "—"}</strong></td>
-                <td>{fee.feeType || "—"}</td>
-                <td>{fee.calcType || "—"}</td>
+                <td><span className="created-count-badge" style={{ minWidth: "auto", fontFamily: "monospace" }}>{fee.feeId || fee.feeCode || "â€”"}</span></td>
+                <td><strong>{fee.feeName || "â€”"}</strong></td>
+                <td>{fee.feeType || "â€”"}</td>
+                <td>{fee.calculationType || fee.calcType || fee.feeType || "—"}</td>
                 <td><strong style={{ color: "var(--primary)" }}>{formatFeeValue(fee)}</strong></td>
-                <td>{fee.createdBy || fee.created_by || fee.username || selectedUsername || "—"}</td>
+                <td>{fee.createdBy || fee.created_by || fee.username || selectedUsername || "â€”"}</td>
                 <td><span className="created-count-badge">{fee.totalUsage ?? 0}</span></td>
                 <td>{formatShortTime(fee.lastUsed)}</td>
-                <td>
-                  <div style={{ display: "flex", gap: 4 }}>
-                    <button
-                      type="button"
-                      className="ar-icon-btn"
-                      onClick={(e) => { e.stopPropagation(); handleEdit(fee, e); }}
-                      title="Edit"
-                    >
-                      <i className="ti ti-edit" />
-                    </button>
-                    <button
-                      type="button"
-                      className="ar-icon-btn ar-icon-btn-danger"
-                      onClick={(e) => { e.stopPropagation(); handleDelete(fee, e); }}
-                      title="Delete"
-                    >
-                      <i className="ti ti-trash" />
-                    </button>
-                  </div>
-                </td>
+                <td>{fee.actions}</td>
               </tr>
             ))}
 
-            {!loading && rows.length === 0 && (
+            {!loading && pagedFees.length === 0 && (
               <tr>
                 <td colSpan="9" className="created-empty">No fees configured</td>
               </tr>
@@ -289,6 +343,7 @@ export default function FeesPage({ selectedUsername }) {
           </tbody>
         </table>
       </div>
+      </DataTableContainer>
 
       {showModal && (
         <div className="modal-backdrop" onClick={(e) => e.target === e.currentTarget && setShowModal(false)}>
@@ -575,3 +630,5 @@ export default function FeesPage({ selectedUsername }) {
     </div>
   );
 }
+
+

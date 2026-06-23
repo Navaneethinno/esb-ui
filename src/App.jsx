@@ -351,6 +351,7 @@ export default function App() {
                 selectedUser={selectedUser}
                 selectedUsername={selectedUsername}
                 activeTab={activeTab}
+                setActiveTab={setActiveTab}
                 workspaceId={selectedUser?.id || selectedUser?.username || ""}
               />
             </div>

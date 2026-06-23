@@ -480,6 +480,8 @@ textarea {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
+  max-width: 100%;
+  width: 100%;
 }
 
 @media (max-width: 767px) {
@@ -1131,6 +1133,8 @@ textarea {
   scrollbar-width: thin;
   scrollbar-color: var(--border) transparent;
   overscroll-behavior: contain;
+  width: 100%;
+  min-width: 0;
 }
 
 .data-table-wrap::-webkit-scrollbar {
@@ -1158,6 +1162,8 @@ textarea {
   display: flex;
   flex-direction: column;
   gap: 20px;
+  width: 100%;
+  min-width: 0;
 }
 
 .data-table {
@@ -5616,6 +5622,8 @@ html[data-theme="dark"] .transaction-exec-table tbody td:first-child {
   scrollbar-color: var(--border) transparent;
   overscroll-behavior: contain;
   scrollbar-gutter: stable both-edges;
+  width: 100%;
+  min-width: 0;
 }
 
 .created-table-wrap::-webkit-scrollbar {

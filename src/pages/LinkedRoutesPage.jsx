@@ -1,5 +1,7 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { getAuditLogs } from "../services/esbApi";
+import { DataTableContainer, TablePagination, useTableQuery } from "../components/shared/DataTable";
+import { PageToolbar } from "../components/shared/PageToolbar";
 
 function getValue(item, paths) {
   for (const path of paths) {
@@ -161,6 +163,20 @@ export default function LinkedRoutesPage({ selectedUsername }) {
     load();
   }, [load]);
 
+  const tableColumns = useMemo(() => [
+    { field: "routeType", label: "Route Type", width: "10%", searchFields: ["routeType"] },
+    { field: "mappingName", label: "Mapping Name", width: "22%", searchFields: ["mappingName", "inboundRequestType", "outboundRequestType"] },
+    { field: "inboundAdapterName", label: "Inbound Adapter", width: "18%", searchFields: ["inboundAdapterName"] },
+    { field: "outboundAdapterName", label: "Outbound Adapter", width: "18%", searchFields: ["outboundAdapterName"] },
+    { field: "executionCount", label: "Executions", width: "10%", searchFields: ["executionCount"] },
+    { field: "successRate", label: "Success Rate", width: "10%", searchFields: ["successRate"] },
+    { field: "avgLatency", label: "Avg Latency", width: "10%", searchFields: ["avgLatency"] },
+    { field: "lastExecutionTime", label: "Last Execution", width: "12%", searchFields: ["lastExecutionTime"] },
+  ], []);
+
+  const tableQuery = useTableQuery(routes, tableColumns, { defaultPageSize: 10 });
+  const pagedRoutes = tableQuery.pagedRows;
+
   return (
     <div className="esb-dashboard">
       <section className="summary-hero">
@@ -169,11 +185,39 @@ export default function LinkedRoutesPage({ selectedUsername }) {
           <h2>Active Linked Routes</h2>
           <p className="dash-banner-desc">All configured adapter link mappings with execution statistics</p>
         </div>
-        <button className="btn-ghost summary-refresh" onClick={load} disabled={loading}>
-          <i className="ti ti-refresh" /> Refresh
-        </button>
       </section>
 
+      <DataTableContainer
+        toolbar={
+          <PageToolbar
+            refreshAction={{
+              onClick: load,
+              loading,
+              label: "Refresh",
+            }}
+            searchProps={{
+              placeholder: "Search linked routes...",
+              value: tableQuery.searchText,
+              onChange: tableQuery.setSearchText,
+              onSubmit: tableQuery.applySearch,
+              columns: tableQuery.searchOptions,
+              selectedColumn: tableQuery.searchColumn,
+              onColumnChange: tableQuery.setSearchColumn,
+              buttonLabel: "Search",
+            }}
+          />
+        }
+        pagination={
+          <TablePagination
+            currentPage={tableQuery.currentPage}
+            pageCount={tableQuery.pageCount}
+            totalItems={tableQuery.totalRows}
+            pageSize={tableQuery.pageSize}
+            onPageChange={tableQuery.setCurrentPage}
+            onPageSizeChange={tableQuery.setPageSize}
+          />
+        }
+      >
       <div className="dash-card">
         {loading && routes.length === 0 ? (
           <div className="compact-empty-panel">
@@ -202,7 +246,7 @@ export default function LinkedRoutesPage({ selectedUsername }) {
                 </tr>
               </thead>
               <tbody>
-                {routes.map((route, index) => (
+                {pagedRoutes.map((route, index) => (
                   <tr key={index}>
                     <td>
                       <span className={`activity-badge ${route.routeType === "HEARTBEAT" ? "pending" : "success"}`}>
@@ -243,6 +287,7 @@ export default function LinkedRoutesPage({ selectedUsername }) {
           </div>
         )}
       </div>
+      </DataTableContainer>
     </div>
   );
 }

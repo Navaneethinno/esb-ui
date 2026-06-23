@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { triggerInboundAdapter, triggerRuntimeAdapter, getApiErrorMessage } from '../services/esbApi';
 import { useAPI } from '../contexts/APIContext';
-import { DataTable, DataTableContainer } from './shared/DataTable';
+import { DataTable, DataTableContainer, TablePagination, useTableQuery } from './shared/DataTable';
 import { PageToolbar } from './shared/PageToolbar';
 
 function getArray(val) {
@@ -94,7 +94,6 @@ export default function AdapterRegistry({ selectedUser, setActiveTab, setSelecte
   const selectedUsername = selectedUser?.username || '';
   const [rawAdapters, setRawAdapters] = useState([]);
   const [status, setStatus] = useState('loading');
-  const [searchQuery, setSearchQuery] = useState('');
   const [filterFormat, setFilterFormat] = useState('All');
   const [filterDirection, setFilterDirection] = useState('All');
 
@@ -187,15 +186,13 @@ export default function AdapterRegistry({ selectedUser, setActiveTab, setSelecte
 
   const displayed = useMemo(() => (rawAdapters || []).filter(adapter => {
     try {
-      const query = String(searchQuery || '').toLowerCase();
-      const matchesSearch = !query || adapterSearchText(adapter).includes(query);
       const matchesFormat = filterFormat === 'All' || String(adapter.formatType).toUpperCase() === String(filterFormat).toUpperCase();
       const matchesDirection = filterDirection === 'All' || adapter.direction === filterDirection;
-      return matchesSearch && matchesFormat && matchesDirection;
+      return matchesFormat && matchesDirection;
     } catch {
       return true;
     }
-  }), [filterDirection, filterFormat, rawAdapters, searchQuery]);
+  }), [filterDirection, filterFormat, rawAdapters]);
 
   const openConfigs = (adapter) => {
     console.log("[AdapterRegistry] openConfigs", {
@@ -228,13 +225,16 @@ export default function AdapterRegistry({ selectedUser, setActiveTab, setSelecte
 
 
   const columns = [
-    { field: 'adapter', label: 'Adapter', width: '30%' },
-    { field: 'adapterType', label: 'Adapter Type', width: '16%' },
-    { field: 'formatType', label: 'Format Type', width: '10%' },
-    { field: 'createdOn', label: 'Created On', width: '15%' },
-    { field: 'requestTypes', label: 'Request Types', width: '14%' },
-    { field: 'actions', label: 'Actions', width: '15%' },
+    { field: 'adapter', label: 'Adapter', width: '30%', searchFields: ['displayName', 'displayId'] },
+    { field: 'adapterType', label: 'Adapter Type', width: '15%', searchFields: ['direction', 'status'] },
+    { field: 'formatType', label: 'Format Type', width: '10%', searchFields: ['formatType'] },
+    { field: 'createdOn', label: 'Created On', width: '15%', searchFields: ['createdAt'] },
+    { field: 'requestTypes', label: 'Request Types', width: '10%', searchFields: ['configCount'] },
+    { field: 'actions', label: 'Actions', width: '20%' },
   ];
+
+  const tableQuery = useTableQuery(displayed, columns, { defaultPageSize: 8 });
+  const pagedAdapters = tableQuery.pagedRows;
 
   const renderCell = (field, row) => {
     const created = formatDate(row.createdAt);
@@ -344,8 +344,13 @@ export default function AdapterRegistry({ selectedUser, setActiveTab, setSelecte
         ]}
         searchProps={{
           placeholder: 'Search all columns...',
-          value: searchQuery,
-          onChange: setSearchQuery,
+          value: tableQuery.searchText,
+          onChange: tableQuery.setSearchText,
+          onSubmit: tableQuery.applySearch,
+          columns: tableQuery.searchOptions,
+          selectedColumn: tableQuery.searchColumn,
+          onColumnChange: tableQuery.setSearchColumn,
+          buttonLabel: 'Search',
         }}
         refreshAction={{
           onClick: loadAdapters,
@@ -360,12 +365,21 @@ export default function AdapterRegistry({ selectedUser, setActiveTab, setSelecte
 
       <DataTable
         columns={columns}
-        data={displayed}
+        data={pagedAdapters}
         isLoading={status === 'loading'}
         emptyMessage="Data not available."
         rowKey="uniqueKey"
         renderCell={renderCell}
         skeletonRows={5}
+      />
+
+      <TablePagination
+        currentPage={tableQuery.currentPage}
+        pageCount={tableQuery.pageCount}
+        totalItems={tableQuery.totalRows}
+        pageSize={tableQuery.pageSize}
+        onPageChange={tableQuery.setCurrentPage}
+        onPageSizeChange={tableQuery.setPageSize}
       />
     </DataTableContainer>
   );

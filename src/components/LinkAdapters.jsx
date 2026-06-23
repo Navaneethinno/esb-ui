@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+﻿import { useEffect, useMemo, useState } from "react";
 import {
   getInboundAdapterConfigurations,
   getOutboundAdapterConfigurations,
@@ -10,19 +10,42 @@ import { invalidateCachePrefix } from "../utils/apiCache";
 import { useAPI } from "../contexts/APIContext";
 import { safeDisplayValue, safeStringifyMasked } from "../utils/maskSensitive";
 
+import LinkAdaptersLoadingSkeleton from "./LinkAdaptersLoadingSkeleton";
+
 // ─── Helpers ────────────────────────────────────────────────────────────────
 const getAdapterId   = (a) => a?.adapterId  || a?.adapter_id  || a?.id  || "";
 const getAdapterName = (a) => a?.adapterName || a?.adapter_name || a?.name || getAdapterId(a);
 const getOutboundId  = (a) => a?.outboundId  || a?.outbound_id  || a?.id  || "";
 const getOutboundName= (a) => a?.name || a?.outboundName || a?.outbound_name || getOutboundId(a);
 const getConfigId    = (c, i = 0) => c?.configId || c?.config_id || c?.id || `config-${i}`;
-const getRequestName = (c, fb = "") => c?.configId || c?.requestName || c?.request_name || c?.requestType || c?.request_type || c?.name || c?.request || fb;
+const getRequestName = (c, fb = "") => c?.requestName || c?.request_name || c?.requestType || c?.request_type || c?.name || c?.request || c?.configId || c?.config_id || c?.id || fb;
 const ROUTE_FUNCTION_TYPES = ["FEE"];
 const PIPELINE_STEP_TYPES = ["FUNCTION", "CONDITION", "STATIC"];
 const PIPELINE_FUNCTIONS = ["ABS","UPPER","LOWER","TRIM","ROUND","ADD_CONSTANT","SUBTRACT_CONSTANT"];
 const PIPELINE_OPERATORS = [">", ">=", "<", "<=", "==", "!="];
 function createRouteFunction() {
   return { functionType: "FEE", feeId: "" };
+}
+
+function normalizeRequestTypeConfig(entry, index = 0, scope = "outbound") {
+  if (!entry || typeof entry !== "object") return { requestName: "", displayName: "", configId: `config-${index}` };
+  const requestName = entry.requestName || entry.request_name || entry.requestType || entry.request_type || entry.name || "";
+  const configId = getConfigId(entry, index);
+  const displayName = requestName || configId || "";
+  if (!requestName && configId) {
+    console.warn(`[LinkAdapters] ${scope} request type missing explicit name; falling back to configId`, {
+      scope,
+      configId,
+      entry,
+    });
+  }
+  return {
+    ...entry,
+    configId,
+    requestName: displayName,
+    displayName,
+    originalRequestName: requestName || "",
+  };
 }
 
 function normalizeRouteFunction(row) {
@@ -254,8 +277,14 @@ function buildMappingObject(rows) {
         mappingType: "DECISION",
         decisionRules: (cleanRow.decisionRules || []).map((rule) => ({
           operator: rule?.operator || ">",
-          compareValue: rule?.compareValue ?? rule?.value ?? "",
-          value: rule?.compareValue ?? rule?.value ?? "",
+          compareMode: rule?.compareMode || "STATIC",
+          compareField: rule?.compareField || "",
+          compareValue: rule?.compareMode === "FIELD"
+            ? (rule?.compareField || rule?.compareValue || rule?.value || "")
+            : (rule?.compareValue ?? rule?.value ?? ""),
+          value: rule?.compareMode === "FIELD"
+            ? (rule?.compareField || rule?.compareValue || rule?.value || "")
+            : (rule?.compareValue ?? rule?.value ?? ""),
           result: rule?.result ?? "",
         })),
         defaultResult: cleanRow.defaultResult || "",
@@ -276,7 +305,7 @@ function mappingObjectToRows(obj) {
       const type = val.mappingType || "DIRECT";
       const resolvedSource = stringValue(val.sourceField) || stringValue(sourceFieldKey);
       const resolvedTarget = stringValue(val.targetField) || stringValue(sourceFieldKey);
-      return { ...emptyRow(resolvedTarget, resolvedSource), mappingType: type, staticValue: val.staticValue || "", pipeline: Array.isArray(val.pipeline) ? val.pipeline.map(normalizePipelineStep) : [], decisionRules: Array.isArray(val.decisionRules) ? val.decisionRules.map((rule) => normalizeDecisionRule({ ...rule, value: rule?.compareValue ?? rule?.value ?? "" })) : [], defaultResult: val.defaultResult || "", feeId: val.feeId || "", applyFeeAs: val.feeMode || val.applyFeeAs || "OVERWRITE", newField: val.newField || "" };
+      return { ...emptyRow(resolvedTarget, resolvedSource), mappingType: type, staticValue: val.staticValue || "", pipeline: Array.isArray(val.pipeline) ? val.pipeline.map(normalizePipelineStep) : [], decisionRules: Array.isArray(val.decisionRules) ? val.decisionRules.map((rule) => normalizeDecisionRule(rule)) : [], defaultResult: val.defaultResult || "", feeId: val.feeId || "", applyFeeAs: val.feeMode || val.applyFeeAs || "OVERWRITE", newField: val.newField || "" };
     }
     return emptyRow("", stringValue(sourceFieldKey));
   });
@@ -334,9 +363,13 @@ function applyCondition(val, op, cv, tv, fv) {
 }
 
 function normalizeDecisionRule(rule = {}) {
+  const compareMode = String(rule?.compareMode || rule?.compare_mode || "STATIC").toUpperCase() === "FIELD" ? "FIELD" : "STATIC";
   return {
     operator: PIPELINE_OPERATORS.includes(String(rule?.operator || ">")) ? String(rule?.operator || ">") : ">",
-    value: rule?.value ?? "",
+    compareMode,
+    compareField: String(rule?.compareField || rule?.compare_field || ""),
+    compareValue: rule?.compareValue ?? rule?.value ?? "",
+    value: rule?.compareValue ?? rule?.value ?? "",
     result: rule?.result ?? "",
   };
 }
@@ -372,8 +405,13 @@ function renderPipelineLabel(step) {
 }
 
 // ─── Mapping Type Modal ────────────────────────────────────────────────────
-function MappingTypeModal({ sourceField, targetField, existingRow, onSelect, onCancel, targetFields = [], fees = [] }) {
-  const [type, setType] = useState(String(existingRow?.mappingType || "DIRECT").toUpperCase());
+function MappingTypeModal({ sourceField, targetField, existingRow, onSelect, onCancel, sourceFields = [], targetFields = [], fees = [], feesLoading = false }) {
+  const initialType = useMemo(() => {
+    const rawType = String(existingRow?.mappingType || "DIRECT").toUpperCase();
+    const hasPipeline = Array.isArray(existingRow?.pipeline) && existingRow.pipeline.length > 0;
+    return rawType === "FUNCTION" || hasPipeline ? "TRANSFORMATION" : rawType;
+  }, [existingRow]);
+  const [type, setType] = useState(initialType);
   const [tgt, setTgt] = useState(targetField || existingRow?.targetField || "");
   const [sv, setSv] = useState(existingRow?.staticValue || "");
   const [pipeline, setPipeline] = useState(Array.isArray(existingRow?.pipeline) ? existingRow.pipeline.map(normalizePipelineStep) : []);
@@ -382,7 +420,18 @@ function MappingTypeModal({ sourceField, targetField, existingRow, onSelect, onC
   const [feeId, setFeeId] = useState(existingRow?.feeId || "");
   const [applyFeeAs, setApplyFeeAs] = useState(existingRow?.applyFeeAs || "OVERWRITE");
   const [newField, setNewField] = useState(existingRow?.newField || "");
+  const availableFees = Array.isArray(fees) ? fees : [];
   const selectedFee = useMemo(() => fees.find((fee) => String(fee.feeId ?? fee.id ?? "") === String(feeId || "")), [fees, feeId]);
+  const compareFieldOptions = useMemo(() => {
+    const all = [...(sourceFields || []), ...(targetFields || [])];
+    const seen = new Set();
+    return all.filter((field) => {
+      const name = String(field?.name || "").trim();
+      if (!name || seen.has(name)) return false;
+      seen.add(name);
+      return true;
+    });
+  }, [sourceFields, targetFields]);
 
   const types = [
     { id: "DIRECT", label: "Direct", icon: "ti-arrow-right", desc: "Map source to target", color: "#16a34a" },
@@ -401,7 +450,7 @@ function MappingTypeModal({ sourceField, targetField, existingRow, onSelect, onC
     [next[index], next[targetIndex]] = [next[targetIndex], next[index]];
     return next;
   });
-  const addRule = () => setDecisionRules(prev => [...prev, { operator: ">", value: "", result: "" }]);
+  const addRule = () => setDecisionRules(prev => [...prev, { operator: ">", compareMode: "STATIC", compareField: "", compareValue: "", result: "" }]);
   const updateRule = (index, patch) => setDecisionRules(prev => prev.map((rule, i) => i === index ? normalizeDecisionRule({ ...rule, ...patch }) : rule));
   const moveRule = (index, direction) => setDecisionRules(prev => {
     const next = [...prev];
@@ -432,7 +481,12 @@ function MappingTypeModal({ sourceField, targetField, existingRow, onSelect, onC
 
   const pipelinePreview = useMemo(() => {
     if (type === "TRANSFORMATION") return pipeline.map(renderPipelineLabel).filter(Boolean);
-    if (type === "DECISION") return decisionRules.map((rule) => `${rule.operator} ${rule.value || "?"} => ${rule.result || "?"}`);
+    if (type === "DECISION") return decisionRules.map((rule) => {
+      const lhs = rule.compareMode === "FIELD"
+        ? (rule.compareField || "field")
+        : (rule.compareValue || rule.value || "?");
+      return `${rule.operator} ${lhs} => ${rule.result || "?"}`;
+    });
     if (type === "FEE") return selectedFee ? [`FEE ${selectedFee.feeName || selectedFee.name || "Selected Fee"}`, `Mode: ${applyFeeAs === "NEW_FIELD" ? "Create New Field" : "Overwrite Existing Field"}`] : ["Select a fee to continue"];
     if (type === "STATIC") return [`STATIC ${sv || "value"}`];
     return sourceField ? [sourceField, "DIRECT", tgt || "Target"] : ["Select a source field", "DIRECT", tgt || "Target"];
@@ -495,35 +549,105 @@ function MappingTypeModal({ sourceField, targetField, existingRow, onSelect, onC
           )}
 
           {type === "TRANSFORMATION" && (
-            <div style={{ display: "grid", gap: 12 }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                <strong style={{ fontSize: 13 }}>Transformation Steps</strong>
-                <button type="button" className="btn-ghost" onClick={addPipelineStep}><i className="ti ti-plus" /> Add Step</button>
+            <div style={{
+              display: "grid",
+              gap: 14,
+              padding: 14,
+              border: "1px solid rgba(124,58,237,0.18)",
+              borderRadius: 14,
+              background: "linear-gradient(180deg, rgba(124,58,237,0.06), rgba(255,255,255,0.02))",
+            }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+                <div>
+                  <strong style={{ fontSize: 13, color: "var(--heading)" }}>Transformation Steps</strong>
+                  <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 4 }}>
+                    Build a sequential pipeline. Example: ABS → CONDITION → ROUND.
+                  </div>
+                </div>
+                <button type="button" className="btn-ghost" onClick={addPipelineStep}>
+                  <i className="ti ti-plus" /> Add Step
+                </button>
               </div>
-              {pipeline.length === 0 && <div style={{ color: "var(--muted)", fontSize: 12 }}>Add one or more transformations.</div>}
+              {pipeline.length === 0 && (
+                <div style={{
+                  color: "var(--muted)",
+                  fontSize: 12,
+                  padding: 12,
+                  border: "1px dashed var(--border)",
+                  borderRadius: 10,
+                  background: "var(--panel-soft)",
+                }}>
+                  No steps yet. Click <strong>Add Step</strong> to start building the pipeline.
+                </div>
+              )}
               {pipeline.map((step, index) => {
                 const normalized = normalizePipelineStep(step);
                 return (
-                  <div key={index} style={{ border: "1px solid var(--border)", borderRadius: 10, padding: 12, background: "var(--panel-soft)", display: "grid", gap: 10 }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <div key={index} style={{
+                    border: "1px solid var(--border)",
+                    borderRadius: 12,
+                    padding: 14,
+                    background: "var(--panel)",
+                    display: "grid",
+                    gap: 10,
+                    boxShadow: "0 8px 24px rgba(15, 23, 42, 0.04)",
+                  }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
                       <strong style={{ fontSize: 12 }}>Step {index + 1}</strong>
-                      <div style={{ display: "flex", gap: 6 }}>
+                      <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
                         <button type="button" className="btn-ghost" onClick={() => movePipelineStep(index, -1)} disabled={index === 0}>Up</button>
                         <button type="button" className="btn-ghost" onClick={() => movePipelineStep(index, 1)} disabled={index === pipeline.length - 1}>Down</button>
                         <button type="button" className="btn-ghost" onClick={() => setPipeline(prev => prev.filter((_, i) => i !== index))}>Remove</button>
                       </div>
                     </div>
                     <div className="field">
-                      <label>Transformation</label>
-                      <select value={normalized.function} onChange={e => updatePipelineStep(index, { type: "FUNCTION", function: e.target.value })}>
-                        {PIPELINE_FUNCTIONS.map(fn => <option key={fn} value={fn}>{fn}</option>)}
+                      <label>Step Type</label>
+                      <select value={normalized.type} onChange={e => updatePipelineStep(index, { type: e.target.value })}>
+                        <option value="FUNCTION">FUNCTION</option>
+                        <option value="CONDITION">CONDITION</option>
+                        <option value="STATIC">STATIC</option>
                       </select>
                     </div>
-                    {["ADD_CONSTANT","SUBTRACT_CONSTANT"].includes(normalized.function) && (
+                    {normalized.type === "FUNCTION" && (
                       <div className="field">
-                        <label>Parameter</label>
-                        <input value={normalized.parameter || ""} onChange={e => updatePipelineStep(index, { parameter: e.target.value })} placeholder="e.g. 10" />
+                        <label>Function</label>
+                        <select value={normalized.function} onChange={e => updatePipelineStep(index, { type: "FUNCTION", function: e.target.value })}>
+                          {PIPELINE_FUNCTIONS.map(fn => <option key={fn} value={fn}>{fn}</option>)}
+                        </select>
                       </div>
+                    )}
+                    {normalized.type === "STATIC" && (
+                      <div className="field">
+                        <label>Static Value</label>
+                        <input value={normalized.value || ""} onChange={e => updatePipelineStep(index, { type: "STATIC", value: e.target.value })} placeholder="e.g. CREDIT" />
+                      </div>
+                    )}
+                    {normalized.type === "CONDITION" && (
+                      <>
+                        <div className="field">
+                          <label>Operator</label>
+                          <select value={normalized.operator || "=="} onChange={e => updatePipelineStep(index, { type: "CONDITION", operator: e.target.value })}>
+                            <option value="==">==</option>
+                            <option value="!=">!=</option>
+                            <option value=">">{">"}</option>
+                            <option value=">=">{">="}</option>
+                            <option value="<">{"<"}</option>
+                            <option value="<=">{"<="}</option>
+                          </select>
+                        </div>
+                        <div className="field">
+                          <label>Compare Value</label>
+                          <input value={normalized.compareValue || ""} onChange={e => updatePipelineStep(index, { type: "CONDITION", compareValue: e.target.value })} placeholder="1000" />
+                        </div>
+                        <div className="field">
+                          <label>True Value</label>
+                          <input value={normalized.ifTrue || ""} onChange={e => updatePipelineStep(index, { type: "CONDITION", ifTrue: e.target.value })} placeholder="CREDIT" />
+                        </div>
+                        <div className="field">
+                          <label>False Value</label>
+                          <input value={normalized.ifFalse || ""} onChange={e => updatePipelineStep(index, { type: "CONDITION", ifFalse: e.target.value })} placeholder="DEBIT" />
+                        </div>
+                      </>
                     )}
                   </div>
                 );
@@ -532,31 +656,156 @@ function MappingTypeModal({ sourceField, targetField, existingRow, onSelect, onC
           )}
 
           {type === "DECISION" && (
-            <div style={{ display: "grid", gap: 12 }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                <strong style={{ fontSize: 13 }}>Decision Rules</strong>
-                <button type="button" className="btn-ghost" onClick={addRule}><i className="ti ti-plus" /> Add Rule</button>
-              </div>
-              {decisionRules.length === 0 && <div style={{ color: "var(--muted)", fontSize: 12 }}>Top to bottom. First matching rule wins.</div>}
-              <div style={{ display: "grid", gridTemplateColumns: "120px 1fr 1fr auto", gap: 8, fontSize: 11, fontWeight: 700, color: "var(--muted)" }}>
-                <div>Operator</div>
-                <div>Value</div>
-                <div>Result</div>
-                <div />
-              </div>
-              {decisionRules.map((rule, index) => (
-                <div key={index} style={{ display: "grid", gridTemplateColumns: "120px 1fr 1fr auto", gap: 8, alignItems: "center" }}>
-                  <select value={rule.operator || ">"} onChange={e => updateRule(index, { operator: e.target.value })}>
-                    {PIPELINE_OPERATORS.map((op) => <option key={op} value={op}>{op}</option>)}
-                  </select>
-                  <input value={rule.value || ""} onChange={e => updateRule(index, { value: e.target.value })} placeholder="500" />
-                  <input value={rule.result || ""} onChange={e => updateRule(index, { result: e.target.value })} placeholder="CREDIT" />
-                  <div style={{ display: "flex", gap: 6 }}>
-                    <button type="button" className="btn-ghost" onClick={() => moveRule(index, -1)} disabled={index === 0}>Up</button>
-                    <button type="button" className="btn-ghost" onClick={() => moveRule(index, 1)} disabled={index === decisionRules.length - 1}>Down</button>
+            <div style={{
+              display: "grid",
+              gap: 14,
+              padding: 14,
+              border: "1px solid rgba(245,158,11,0.2)",
+              borderRadius: 14,
+              background: "linear-gradient(180deg, rgba(245,158,11,0.06), rgba(255,255,255,0.02))",
+            }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+                <div>
+                  <strong style={{ fontSize: 13, color: "var(--heading)" }}>Decision Flow</strong>
+                  <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 4 }}>
+                    Build ordered conditions. First matching rule wins.
                   </div>
                 </div>
-              ))}
+                <button type="button" className="btn-ghost" onClick={addRule}>
+                  <i className="ti ti-plus" /> Add Condition
+                </button>
+              </div>
+
+              <div className="field" style={{ margin: 0 }}>
+                <label>Compare Field</label>
+                <select value={sourceField || ""} disabled>
+                  <option value="">{sourceField || "Source field"}</option>
+                </select>
+              </div>
+
+              {decisionRules.length === 0 && (
+                <div style={{
+                  color: "var(--muted)",
+                  fontSize: 12,
+                  padding: 12,
+                  border: "1px dashed var(--border)",
+                  borderRadius: 10,
+                  background: "var(--panel-soft)",
+                }}>
+                  No conditions yet. Click <strong>Add Condition</strong> to start building the decision flow.
+                </div>
+              )}
+
+              <div style={{ display: "grid", gap: 12 }}>
+                {decisionRules.map((rule, index) => {
+                  const normalized = normalizeDecisionRule(rule);
+                  const compareAgainstField = normalized.compareMode === "FIELD";
+                  return (
+                    <div
+                      key={index}
+                      style={{
+                        border: "1px solid var(--border)",
+                        borderRadius: 12,
+                        padding: 14,
+                        background: "var(--panel)",
+                        display: "grid",
+                        gap: 12,
+                        boxShadow: "0 8px 24px rgba(15, 23, 42, 0.04)",
+                      }}
+                    >
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                        <strong style={{ fontSize: 12 }}>Condition {index + 1}</strong>
+                        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                          <button type="button" className="btn-ghost" onClick={() => moveRule(index, -1)} disabled={index === 0}>Up</button>
+                          <button type="button" className="btn-ghost" onClick={() => moveRule(index, 1)} disabled={index === decisionRules.length - 1}>Down</button>
+                          <button
+                            type="button"
+                            className="btn-ghost"
+                            onClick={() => setDecisionRules((prev) => prev.filter((_, i) => i !== index))}
+                          >
+                            Remove
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="field">
+                        <label>Operator</label>
+                        <select
+                          value={normalized.operator || ">"}
+                          onChange={e => updateRule(index, { operator: e.target.value })}
+                        >
+                          {PIPELINE_OPERATORS.map((op) => <option key={op} value={op}>{op}</option>)}
+                        </select>
+                      </div>
+
+                      <div style={{
+                        border: "1px solid rgba(245,158,11,0.18)",
+                        borderRadius: 12,
+                        padding: 12,
+                        background: "rgba(245,158,11,0.04)",
+                        display: "grid",
+                        gap: 10,
+                      }}>
+                        <div className="field" style={{ margin: 0 }}>
+                          <label>Compare Against</label>
+                          <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+                            <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--heading)" }}>
+                              <input
+                                type="radio"
+                                checked={!compareAgainstField}
+                                onChange={() => updateRule(index, { compareMode: "STATIC", compareField: "", compareValue: normalized.compareValue || "" })}
+                              />
+                              Static Value
+                            </label>
+                            <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--heading)" }}>
+                              <input
+                                type="radio"
+                                checked={compareAgainstField}
+                                onChange={() => updateRule(index, { compareMode: "FIELD", compareField: normalized.compareField || compareFieldOptions[0]?.name || "", compareValue: normalized.compareValue || "" })}
+                              />
+                              Another Field
+                            </label>
+                          </div>
+                        </div>
+
+                        {compareAgainstField ? (
+                          <div className="field" style={{ margin: 0 }}>
+                            <label>Compare Field</label>
+                            <select
+                              value={normalized.compareField || ""}
+                              onChange={e => updateRule(index, { compareMode: "FIELD", compareField: e.target.value })}
+                            >
+                              <option value="">-- Select field --</option>
+                              {compareFieldOptions.map((field) => (
+                                <option key={field.name} value={field.name}>{field.name}</option>
+                              ))}
+                            </select>
+                          </div>
+                        ) : (
+                          <div className="field" style={{ margin: 0 }}>
+                            <label>Compare Value</label>
+                            <input
+                              value={normalized.compareValue || ""}
+                              onChange={e => updateRule(index, { compareMode: "STATIC", compareValue: e.target.value, compareField: "" })}
+                              placeholder="1000"
+                            />
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="field">
+                        <label>Result Value</label>
+                        <input
+                          value={normalized.result || ""}
+                          onChange={e => updateRule(index, { result: e.target.value })}
+                          placeholder="CREDIT"
+                        />
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+
               <div className="field">
                 <label>Default Result</label>
                 <input value={defaultResult} onChange={e => setDefaultResult(e.target.value)} placeholder="NORMAL" />
@@ -565,20 +814,65 @@ function MappingTypeModal({ sourceField, targetField, existingRow, onSelect, onC
           )}
 
           {type === "FEE" && (
-            <div style={{ display: "grid", gap: 12 }}>
-              <div className="field">
-                <label>Fee</label>
-                <select value={feeId} onChange={e => setFeeId(e.target.value)}>
-                  <option value="">-- Select fee --</option>
-                  {fees.map(fee => {
-                    const feeName = fee.feeName || fee.name || fee.fee_name || `Fee ${fee.feeId || fee.id}`;
-                    const feeCode = fee.feeCode || fee.code || fee.fee_code || "";
-                    const feeOwner = fee.createdByUser || fee.created_by_user || fee.username || "";
-                    return <option key={fee.feeId || fee.id || feeCode} value={fee.feeId || fee.id}>{feeName}{feeCode ? ` (${feeCode})` : ""}{feeOwner ? ` • ${feeOwner}` : ""}</option>;
-                  })}
-                </select>
+            <div style={{
+              display: "grid",
+              gap: 12,
+              padding: 14,
+              border: "1px solid rgba(14,165,233,0.18)",
+              borderRadius: 14,
+              background: "linear-gradient(180deg, rgba(14,165,233,0.06), rgba(255,255,255,0.02))",
+            }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+                <div>
+                  <strong style={{ fontSize: 13, color: "var(--heading)" }}>Fee</strong>
+                  <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 4 }}>
+                    Apply a fee function during route processing.
+                  </div>
+                </div>
+                <span style={{
+                  fontSize: 11,
+                  fontWeight: 700,
+                  color: "var(--primary)",
+                  background: "var(--primary-soft)",
+                  border: "1px solid rgba(22,163,74,0.16)",
+                  borderRadius: 999,
+                  padding: "4px 10px",
+                }}>
+                  {availableFees.length} fee{availableFees.length === 1 ? "" : "s"}
+                </span>
               </div>
-              {selectedFee && (
+
+              {feesLoading ? (
+                <div style={{ display: "flex", alignItems: "center", gap: 10, color: "var(--muted)", fontSize: 12 }}>
+                  <i className="ti ti-loader-2 spin" />
+                  Loading fees...
+                </div>
+              ) : availableFees.length === 0 ? (
+                <div style={{
+                  padding: 12,
+                  border: "1px dashed var(--border)",
+                  borderRadius: 10,
+                  background: "var(--panel-soft)",
+                  color: "var(--muted)",
+                  fontSize: 12,
+                }}>
+                  No fees available. Create a fee first.
+                </div>
+              ) : (
+                <div className="field">
+                  <label>Fee</label>
+                  <select value={feeId} onChange={e => setFeeId(e.target.value)}>
+                    <option value="">-- Select fee --</option>
+                    {availableFees.map(fee => {
+                      const feeName = fee.feeName || fee.name || fee.fee_name || `Fee ${fee.feeId || fee.id}`;
+                      const feeCode = fee.feeCode || fee.code || fee.fee_code || "";
+                      const feeOwner = fee.createdByUser || fee.created_by_user || fee.username || "";
+                      return <option key={fee.feeId || fee.id || feeCode} value={fee.feeId || fee.id}>{feeName}{feeCode ? ` (${feeCode})` : ""}{feeOwner ? ` • ${feeOwner}` : ""}</option>;
+                    })}
+                  </select>
+                </div>
+              )}
+              {selectedFee && !feesLoading && (
                 <div style={{ border: "1px solid var(--border)", borderRadius: 10, padding: 12, background: "var(--panel-soft)", display: "grid", gap: 4, fontSize: 12, color: "var(--muted)" }}>
                   <strong style={{ color: "var(--heading)" }}>{selectedFee.feeName || selectedFee.name || "Selected Fee"}</strong>
                   <span>Fee ID: {selectedFee.feeId || selectedFee.id}</span>
@@ -648,7 +942,12 @@ function MappingRow({ row, onRemove, onEdit }) {
     if (type === "STATIC")    return <><span className="la-flow-pill la-flow-pill--static">"{safeDisplayValue(row.staticValue)}"</span></>; 
     if (type === "CONDITION") {
       const summary = Array.isArray(row.decisionRules) && row.decisionRules.length > 0
-        ? row.decisionRules.map((rule) => `${rule.operator || ">"} ${safeDisplayValue(rule.value)} -> ${safeDisplayValue(rule.result)}`).join(" | ")
+        ? row.decisionRules.map((rule) => {
+            const compare = rule.compareMode === "FIELD"
+              ? safeDisplayValue(rule.compareField || rule.value)
+              : safeDisplayValue(rule.compareValue ?? rule.value);
+            return `${rule.operator || ">"} ${compare} -> ${safeDisplayValue(rule.result)}`;
+          }).join(" | ")
         : `${safeDisplayValue(row.sourceField)||"field"} ${row.operator} ${safeDisplayValue(row.conditionValue)} ? ${safeDisplayValue(row.trueValue)} : ${safeDisplayValue(row.falseValue)}`;
       return <span className="la-flow-pill la-flow-pill--cond">{summary}</span>;
     }
@@ -688,7 +987,21 @@ function FieldPill({ field, state, isSelected, onClick }) {
 }
 
 // ─── Mapping Studio ───────────────────────────────────────────────────────────
-function MappingStudio({ sourceLabel, targetLabel, sourceAdapterName, targetAdapterName, sourceFields, targetFields, rows, setRows, isStrictProtocol = false, fees = [] }) {
+function MappingStudio({
+  sourceLabel,
+  targetLabel,
+  sourceAdapterName,
+  targetAdapterName,
+  sourceFields,
+  targetFields,
+  sourceGroups = [],
+  targetGroups = [],
+  rows,
+  setRows,
+  isStrictProtocol = false,
+  fees = [],
+  feesLoading = false,
+}) {
   const [selectedSource, setSelectedSource] = useState(null);
   const [mappingModal, setMappingModal]     = useState(null); // { sourceField, targetField, existingRow }
   const [suggestions, setSuggestions]       = useState([]);
@@ -737,6 +1050,40 @@ function MappingStudio({ sourceLabel, targetLabel, sourceAdapterName, targetAdap
   const handleAutoMatch = () => {
     const s = suggestMappings(sourceFields, targetFields, rows);
     setSuggestions(s);
+  };
+
+  const renderFieldGroup = (group, side) => {
+    const accent = group.accent || group.color || "#22c55e";
+    const groupFields = Array.isArray(group.fields) ? group.fields : [];
+    return (
+      <div key={group.key || group.title} style={{ border: `1px solid ${accent}33`, borderRadius: 12, overflow: "hidden", background: "rgba(255,255,255,0.78)" }}>
+        <div style={{ padding: "10px 12px", borderBottom: `1px solid ${accent}22`, background: `${accent}10` }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <span style={{ width: 10, height: 10, borderRadius: 999, background: accent, display: "inline-block" }} />
+              <strong style={{ fontSize: 12, fontWeight: 800, color: accent, textTransform: "uppercase", letterSpacing: "0.08em" }}>
+                {group.title}
+              </strong>
+            </div>
+            {group.note && <span style={{ fontSize: 11, color: "var(--muted)" }}>{group.note}</span>}
+          </div>
+        </div>
+        <div className="la-column-body" style={{ padding: 10 }}>
+          {groupFields.length === 0
+            ? <p className="la-empty-fields">Select a request type to see fields</p>
+            : groupFields.map(f => (
+                <FieldPill
+                  key={`${group.key || group.title}-${f.name}`}
+                  field={f}
+                  state={fieldState(f, side)}
+                  isSelected={side === "source" ? selectedSource === f.name : false}
+                  onClick={side === "source" ? () => handleSourceClick(f) : () => handleTargetClickDirect(f)}
+                />
+              ))
+          }
+        </div>
+      </div>
+    );
   };
 
   const acceptSuggestions = () => {
@@ -821,17 +1168,19 @@ function MappingStudio({ sourceLabel, targetLabel, sourceAdapterName, targetAdap
             <span>{sourceFields.length} fields</span>
           </div>
           <div className="la-column-body">
-            {sourceFields.length === 0
-              ? <p className="la-empty-fields">Select a request type to see fields</p>
-              : sourceFields.map(f => (
-                  <FieldPill
-                    key={f.name}
-                    field={f}
-                    state={fieldState(f, "source")}
-                    isSelected={selectedSource === f.name}
-                    onClick={() => handleSourceClick(f)}
-                  />
-                ))
+            {sourceGroups.length > 0
+              ? sourceGroups.map((group) => renderFieldGroup(group, "source"))
+              : sourceFields.length === 0
+                ? <p className="la-empty-fields">Select a request type to see fields</p>
+                : sourceFields.map(f => (
+                    <FieldPill
+                      key={f.name}
+                      field={f}
+                      state={fieldState(f, "source")}
+                      isSelected={selectedSource === f.name}
+                      onClick={() => handleSourceClick(f)}
+                    />
+                  ))
             }
           </div>
         </div>
@@ -902,17 +1251,19 @@ function MappingStudio({ sourceLabel, targetLabel, sourceAdapterName, targetAdap
             <span>{targetFields.length} fields</span>
           </div>
           <div className="la-column-body">
-            {targetFields.length === 0
-              ? <p className="la-empty-fields">Select a request type to see fields</p>
-              : targetFields.map(f => (
-                  <FieldPill
-                    key={f.name}
-                    field={f}
-                    state={fieldState(f, "target")}
-                    isSelected={false}
-                    onClick={() => handleTargetClickDirect(f)}
-                  />
-                ))
+            {targetGroups.length > 0
+              ? targetGroups.map((group) => renderFieldGroup(group, "target"))
+              : targetFields.length === 0
+                ? <p className="la-empty-fields">Select a request type to see fields</p>
+                : targetFields.map(f => (
+                    <FieldPill
+                      key={f.name}
+                      field={f}
+                      state={fieldState(f, "target")}
+                      isSelected={false}
+                      onClick={() => handleTargetClickDirect(f)}
+                    />
+                  ))
             }
           </div>
         </div>
@@ -925,7 +1276,10 @@ function MappingStudio({ sourceLabel, targetLabel, sourceAdapterName, targetAdap
           existingRow={mappingModal.existingRow}
           onSelect={applyMapping}
           onCancel={() => setMappingModal(null)}
+          sourceFields={sourceFields}
           targetFields={targetFields}
+          fees={fees}
+          feesLoading={feesLoading}
         />
       )}
     </div>
@@ -1127,6 +1481,7 @@ export default function LinkAdapters({ selectedUsername }) {
   const [status, setStatus] = useState("idle");
   const [error, setError]   = useState("");
   const [availableFees, setAvailableFees] = useState([]);
+  const [feesLoading, setFeesLoading] = useState(false);
   console.log("LINK_ADAPTERS_DATA", { selectedUsername, inboundList, outboundList, availableFees });
   console.log("selectedOutboundRequests", selectedOutboundRequests);
 
@@ -1168,7 +1523,8 @@ export default function LinkAdapters({ selectedUsername }) {
     }
 
     setLoading(true);
-      Promise.all([
+    setFeesLoading(true);
+    Promise.all([
       loadInboundAdapters(selectedUsername),
       loadOutboundAdapters(selectedUsername),
       getFees(selectedUsername)
@@ -1196,7 +1552,10 @@ export default function LinkAdapters({ selectedUsername }) {
       setLinkedConfigs([]);
     }).catch(err => {
       console.error('[LinkAdapters] Failed to load adapters:', err);
-    }).finally(() => setLoading(false));
+    }).finally(() => {
+      setLoading(false);
+      setFeesLoading(false);
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedUsername]); // Only depend on selectedUsername
 
@@ -1231,9 +1590,10 @@ export default function LinkAdapters({ selectedUsername }) {
     getOutboundAdapterConfigurations(selOutbound)
       .then((configs) => {
         const configsArray = Array.isArray(configs) ? configs : [];
-        setOutboundConfigs(configsArray);
-        // Use configs directly as request types since listRequestTypes returns empty
-        setOutboundRequestTypes(configsArray);
+        const normalizedConfigs = configsArray.map((cfg, index) => normalizeRequestTypeConfig(cfg, index, "outbound"));
+        setOutboundConfigs(normalizedConfigs);
+        // Use normalized configs directly as request types since listRequestTypes returns empty
+        setOutboundRequestTypes(normalizedConfigs);
       })
       .catch((err) => {
         console.error('[LinkAdapters] Failed to load outbound configs:', err);
@@ -1252,8 +1612,9 @@ export default function LinkAdapters({ selectedUsername }) {
     getOutboundAdapterConfigurations(selOutbound2)
       .then((configs) => {
         const configsArray = Array.isArray(configs) ? configs : [];
-        setOutboundConfigs2(configsArray);
-        setOutboundRequestTypes2(configsArray);
+        const normalizedConfigs = configsArray.map((cfg, index) => normalizeRequestTypeConfig(cfg, index, "outbound-secondary"));
+        setOutboundConfigs2(normalizedConfigs);
+        setOutboundRequestTypes2(normalizedConfigs);
       })
       .catch((err) => {
         console.error('[LinkAdapters] Failed to load outbound2 configs:', err);
@@ -1438,6 +1799,47 @@ export default function LinkAdapters({ selectedUsername }) {
     const protocolFields = extractProtocolFieldsFromConfig(outboundConfig, "response");
     return isStrictProtocolFormat(outboundConfig) ? protocolFields : (protocolFields.length > 0 ? protocolFields : extractFields(getPath(outboundConfig, RESPONSE_SCHEMA_KEYS)));
   }, [outboundConfig]);
+  const groupPalette = ["#16a34a", "#2563eb", "#9333ea", "#ea580c", "#0f766e", "#be185d"];
+
+  const outboundRequestFieldGroups = useMemo(() => {
+    const names = outboundRequestTabNames.length > 0
+      ? outboundRequestTabNames
+      : (currentOutboundRequestName ? [currentOutboundRequestName] : []);
+
+    return names.map((name, index) => {
+      const cfg = outboundConfigs.find((c, i) => getConfigId(c, i) === name || getRequestName(c, "") === name);
+      const protocolFields = extractProtocolFieldsFromConfig(cfg, "request");
+      const fields = isStrictProtocolFormat(cfg)
+        ? protocolFields
+        : (protocolFields.length > 0 ? protocolFields : extractFields(getPath(cfg, REQUEST_SCHEMA_KEYS)));
+      return {
+        key: name,
+        title: name,
+        accent: groupPalette[index % groupPalette.length],
+        fields: fields.length > 0 ? fields : outboundRequestFields,
+      };
+    });
+  }, [outboundConfigs, outboundRequestFields, outboundRequestTabNames, currentOutboundRequestName]);
+
+  const outboundResponseFieldGroups = useMemo(() => {
+    const names = outboundRequestTabNames.length > 0
+      ? outboundRequestTabNames
+      : (currentOutboundRequestName ? [currentOutboundRequestName] : []);
+
+    return names.map((name, index) => {
+      const cfg = outboundConfigs.find((c, i) => getConfigId(c, i) === name || getRequestName(c, "") === name);
+      const protocolFields = extractProtocolFieldsFromConfig(cfg, "response");
+      const fields = isStrictProtocolFormat(cfg)
+        ? protocolFields
+        : (protocolFields.length > 0 ? protocolFields : extractFields(getPath(cfg, RESPONSE_SCHEMA_KEYS)));
+      return {
+        key: name,
+        title: name,
+        accent: groupPalette[index % groupPalette.length],
+        fields: fields.length > 0 ? fields : outboundResponseFields,
+      };
+    });
+  }, [outboundConfigs, outboundResponseFields, outboundRequestTabNames, currentOutboundRequestName]);
 
   const requestMappings  = useMemo(() => buildMappingObject(requestRows),  [requestRows]);
   const responseMappings = useMemo(() => buildMappingObject(responseRows), [responseRows]);
@@ -1558,7 +1960,7 @@ export default function LinkAdapters({ selectedUsername }) {
     }
   };
 
-  if (loading) return <p className="status loading">Loading adapters…</p>;
+  if (loading) return <LinkAdaptersLoadingSkeleton />;
 
   return (
     <div className="la-page">
@@ -1585,6 +1987,17 @@ export default function LinkAdapters({ selectedUsername }) {
                 {inboundList.map((a, i) => <option key={`${getAdapterId(a)}-${i}`} value={getAdapterId(a)}>{getAdapterName(a)}</option>)}
               </select>
             </div>
+            <div className="field">
+              <label>Request Type</label>
+              <select value={selInboundReq} onChange={e => handleInboundRequestChange(e.target.value)} disabled={!selInbound || inboundLoading}>
+                <option value="">{selInbound ? "Select request type" : "Select adapter first"}</option>
+                {inboundRequestTypes.map((c, i) => {
+                  const name = getRequestName(c, "");
+                  const id = getConfigId(c, i) || name;
+                  return name ? <option key={id} value={name}>{name}</option> : null;
+                })}
+              </select>
+            </div>
           </div>
 
           <div className="la-setup-sep">
@@ -1600,238 +2013,129 @@ export default function LinkAdapters({ selectedUsername }) {
                 {outboundList.map((a, i) => <option key={`${getOutboundId(a)}-${i}`} value={getOutboundId(a)}>{getOutboundName(a)}</option>)}
               </select>
             </div>
+            <div className="field">
+              <label>Request Type</label>
+              <div style={{ display: "grid", gap: 10 }}>
+                {(oneToManyEnabled ? (selectedOutboundRequests.length ? selectedOutboundRequests : [{ requestName: "" }]) : [{ requestName: selectedOutboundRequests[0]?.requestName || "" }]).map((row, index) => {
+                  const selectedNames = selectedOutboundRequests.map((item) => item?.requestName).filter(Boolean);
+                  return (
+                    <div key={`outbound-request-${index}`} style={{ display: "grid", gridTemplateColumns: oneToManyEnabled && index > 0 ? "1fr auto" : "1fr", gap: 10, alignItems: "center" }}>
+                      <select
+                        value={row?.requestName || ""}
+                        onChange={(e) => handleOutboundRequestChange(index, e.target.value)}
+                        disabled={!selOutbound || outboundLoading}
+                      >
+                      <option value="">{selOutbound ? "Select request type" : "Select adapter first"}</option>
+                      {outboundRequestTypes.map((c, i) => {
+                        const name = getRequestName(c, "");
+                        const id = getConfigId(c, i) || name;
+                        const selectedInAnotherRow = selectedNames.includes(name) && name !== row?.requestName;
+                          return name && !selectedInAnotherRow ? <option key={id} value={name}>{name}</option> : null;
+                        })}
+                      </select>
+                      {oneToManyEnabled && index > 0 && (
+                        <button
+                          type="button"
+                          className="ar-icon-btn ar-icon-btn-danger"
+                          onClick={() => handleRemoveOutboundRequestType(index)}
+                          title="Remove outbound request type"
+                          aria-label="Remove outbound request type"
+                          style={{ minWidth: 40, height: 40, display: "inline-flex", alignItems: "center", justifyContent: "center", opacity: 1 }}
+                        >
+                          <i className="ti ti-trash" />
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, marginTop: 12 }}>
+              <label style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 13, fontWeight: 600, color: "var(--heading)", whiteSpace: "nowrap" }}>
+                <input
+                  type="checkbox"
+                  checked={oneToManyEnabled}
+                  onChange={(e) => {
+                    const checked = e.target.checked;
+                    setOneToManyEnabled(checked);
+                    if (!checked) {
+                      setSelectedOutboundRequests((current) => current.length ? [current[0]] : []);
+                      setActiveOutboundRequestTab(selectedOutboundRequests[0]?.requestName || "");
+                    } else if (!selectedOutboundRequests.length && currentOutboundRequestName) {
+                      setSelectedOutboundRequests([{ requestName: currentOutboundRequestName }]);
+                    }
+                  }}
+                />
+                Multiple Outbound Request Types
+              </label>
+              {oneToManyEnabled && (
+                <button
+                  type="button"
+                  className="btn-ghost"
+                  onClick={handleAddOutboundRequestType}
+                  disabled={!selOutbound || outboundLoading}
+                  style={{ padding: "6px 12px", fontSize: 12, height: 32 }}
+                >
+                  <i className="ti ti-plus" /> Add Request Type
+                </button>
+              )}
+            </div>
           </div>
         </div>
       </section>
 
 
       <section className="la-section" style={{ marginTop: 28 }}>
-        <div className="la-flow-card" style={{ padding: 16 }}>
-          <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 16, marginBottom: 14 }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+        <div className="la-flow-card" style={{ padding: 18 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 16, marginBottom: 14 }}>
+            <div>
               <div className="la-section-badge la-section-badge--req">REQUEST</div>
-              <div>
-                <h3 className="la-section-title" style={{ margin: 0 }}>Request Configuration</h3>
-                <p className="la-section-sub" style={{ margin: "4px 0 0" }}>Keep one inbound request type and add outbound request tabs when required.</p>
-              </div>
-            </div>
-            <label style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 13, fontWeight: 600, whiteSpace: "nowrap" }}>
-              <input
-                type="checkbox"
-                checked={oneToManyEnabled}
-                onChange={(e) => {
-                  const checked = e.target.checked;
-                  setOneToManyEnabled(checked);
-                  if (!checked) {
-                    setSelectedOutboundRequests((current) => current.length ? [current[0]] : []);
-                    setActiveOutboundRequestTab(selectedOutboundRequests[0]?.requestName || "");
-                  } else if (!selectedOutboundRequests.length && currentOutboundRequestName) {
-                    setSelectedOutboundRequests([{ requestName: currentOutboundRequestName }]);
-                  }
-                }}
-              />
-              Multiple Outbound Request Types
-            </label>
-          </div>
-
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, alignItems: "start" }}>
-            <div className="field">
-              <label style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>Inbound Request Type</label>
-              <select
-                value={selInboundReq}
-                onChange={(e) => handleInboundRequestChange(e.target.value)}
-                disabled={!selInbound || inboundLoading}
-                style={{ height: 32 }}
-              >
-                <option value="">{selInbound ? "Select inbound request type" : "Select inbound adapter first"}</option>
-                {inboundRequestTypes.map((c, i) => {
-                  const name = getRequestName(c, "");
-                  const id = getConfigId(c, i) || name;
-                  return name ? <option key={id} value={name}>{name}</option> : null;
-                })}
-              </select>
-            </div>
-
-            <div className="field">
-              <label style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>Outbound Request Type</label>
-              <div style={{ display: "grid", gap: 10 }}>
-                {(oneToManyEnabled ? (selectedOutboundRequests.length ? selectedOutboundRequests : [{ requestName: "" }]) : [{ requestName: selectedOutboundRequests[0]?.requestName || "" }]).map((row, index) => (
-                  <div key={`outbound-request-${index}`} style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 10, alignItems: "center" }}>
-                    <select
-                      value={row?.requestName || ""}
-                      onChange={(e) => handleOutboundRequestChange(index, e.target.value)}
-                      disabled={!selOutbound || outboundLoading}
-                      style={{ height: 32 }}
-                    >
-                      <option value="">{selOutbound ? "Select outbound request type" : "Select outbound adapter first"}</option>
-                      {outboundRequestTypes.map((c, i) => {
-                        const name = getRequestName(c, "");
-                        const id = getConfigId(c, i) || name;
-                        return name && name !== (row?.requestName || "") ? <option key={id} value={name}>{name}</option> : null;
-                      })}
-                    </select>
-                    {oneToManyEnabled && index > 0 && (
-                      <button
-                        type="button"
-                        className="ar-icon-btn ar-icon-btn-danger"
-                        onClick={() => handleRemoveOutboundRequestType(index)}
-                        title="Remove outbound request type"
-                        aria-label="Remove outbound request type"
-                        style={{ minWidth: 44, height: 44, display: "inline-flex", alignItems: "center", justifyContent: "center", border: "1px solid var(--danger)", background: "rgba(239,68,68,0.08)", color: "var(--danger)", opacity: 1 }}
-                      >
-                        <i className="ti ti-trash" style={{ fontSize: 16 }} />
-                      </button>
-                    )}
-                  </div>
-                ))}
-              </div>
+              <h3 className="la-section-title" style={{ margin: "8px 0 4px" }}>REQUEST PAYLOAD MAPPING</h3>
+              <p className="la-section-sub" style={{ margin: 0 }}>Inbound Request → Outbound Request(s)</p>
             </div>
           </div>
 
-          {oneToManyEnabled && (
-            <div style={{ marginTop: 12, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
-              <p style={{ margin: 0, color: "var(--muted)", fontSize: 13 }}>
-                Add more outbound request tabs for the same adapter pair.
-              </p>
-              <button
-                type="button"
-                className="btn-ghost"
-                onClick={handleAddOutboundRequestType}
-                disabled={!selOutbound || outboundLoading}
-                style={{ padding: "6px 12px", fontSize: 12, height: 32 }}
-              >
-                <i className="ti ti-plus" /> Add Request Type
-              </button>
-            </div>
-          )}
-
-          {oneToManyEnabled && outboundRequestTabNames.length > 0 && (
-            <div style={{ marginTop: 14, display: "flex", flexWrap: "wrap", gap: 10 }}>
-              {outboundRequestTabNames.map((name) => (
-                <button
-                  key={name}
-                  type="button"
-                  onClick={() => handleOutboundRequestTabClick(name)}
-                  className="btn-ghost"
-                  style={{
-                    padding: "8px 14px",
-                    fontSize: 13,
-                    borderRadius: 999,
-                    border: activeOutboundRequestTab === name ? "1px solid var(--primary)" : "1px solid var(--border)",
-                    background: activeOutboundRequestTab === name ? "rgba(22,163,74,0.08)" : "var(--card)",
-                    color: "var(--heading)",
-                  }}
-                >
-                  {name}
-                </button>
-              ))}
-            </div>
-          )}
-
-          {oneToManyEnabled && (
-            <pre style={{ margin: "10px 0 0", padding: 10, borderRadius: 8, background: "rgba(0,0,0,0.04)", fontSize: 12, color: "var(--muted)", overflowX: "auto" }}>
-              {JSON.stringify(selectedOutboundRequests.map((item) => item?.requestName).filter(Boolean))}
-            </pre>
-          )}
-
-          <IntegrationFlowCard
-            outboundName={outboundAdapterName}
-            inboundName={inboundAdapterName}
-            outboundRequestName={outboundRequestName}
-            inboundRequestName={inboundRequestName}
-            outboundRequestNames={oneToManyEnabled ? outboundRequestTabNames : [selectedOutboundRequests[0]?.requestName].filter(Boolean)}
+          <MappingStudio
+            sourceLabel={`${inboundAdapterName} Request Fields`}
+            targetLabel="Outbound Request Fields"
+            sourceAdapterName={inboundAdapterName}
+            targetAdapterName={outboundAdapterName}
+            sourceFields={inboundRequestFields}
+            targetFields={outboundRequestFieldGroups.flatMap((group) => group.fields)}
+            targetGroups={outboundRequestFieldGroups}
+            rows={requestRows}
+            setRows={setRequestRows}
+            isStrictProtocol={isStrictProtocolFormat(inboundConfig) || isStrictProtocolFormat(outboundConfig)}
+            fees={availableFees}
+            feesLoading={feesLoading}
           />
+        </div>
 
-          <div style={{ marginTop: 18 }}>
-            <div className="la-flow-card" style={{ padding: 16 }}>
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, marginBottom: 12 }}>
-                <div>
-                  <h4 style={{ margin: 0, color: "var(--heading)" }}>
-                    Currently Editing
-                  </h4>
-                  <p style={{ margin: "4px 0 0", color: "var(--muted)", fontSize: 13 }}>
-                    {activeOutboundRequestTab || selectedOutboundRequests[0]?.requestName || "Select an outbound request type to configure its mappings."}
-                  </p>
-                </div>
-                <span className="la-section-badge la-section-badge--req">PIPELINE</span>
-              </div>
-
-              {selInboundReq ? (
-                <>
-                  <MappingStudio
-                    sourceLabel={`${inboundAdapterName} Request Fields`}
-                    targetLabel={`${outboundAdapterName} Request Fields`}
-                    sourceAdapterName={outboundAdapterName}
-                    targetAdapterName={inboundAdapterName}
-                    sourceFields={inboundRequestFields}
-                    targetFields={outboundRequestFields}
-                    rows={requestRows}
-                    setRows={setRequestRows}
-                    isStrictProtocol={isStrictProtocolFormat(inboundConfig) || isStrictProtocolFormat(outboundConfig)}
-                    fees={availableFees}
-                  />
-
-                  <div style={{ marginTop: 18 }}>
-                    <MappingStudio
-                      sourceLabel={`${outboundAdapterName} Response Fields`}
-                      targetLabel={`${inboundAdapterName} Response Fields`}
-                      sourceAdapterName={outboundAdapterName}
-                      targetAdapterName={inboundAdapterName}
-                      sourceFields={outboundResponseFields}
-                      targetFields={inboundResponseFields}
-                      rows={responseRows}
-                      setRows={setResponseRows}
-                      isStrictProtocol={isStrictProtocolFormat(inboundConfig) || isStrictProtocolFormat(outboundConfig)}
-                      fees={availableFees}
-                    />
-                  </div>
-                </>
-              ) : (
-                <div style={{ padding: "18px 4px", color: "var(--muted)", fontSize: 14 }}>
-                  Select an inbound request type to configure the mapping designer.
-                </div>
-              )}
+        <div className="la-flow-card" style={{ padding: 18, marginTop: 18 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 16, marginBottom: 14 }}>
+            <div>
+              <div className="la-section-badge la-section-badge--resp">RESPONSE</div>
+              <h3 className="la-section-title" style={{ margin: "8px 0 4px" }}>RESPONSE PAYLOAD MAPPING</h3>
+              <p className="la-section-sub" style={{ margin: 0 }}>Outbound Response(s) → Inbound Response</p>
             </div>
           </div>
 
-          {oneToManyEnabled && (
-            <div style={{ marginTop: 18 }}>
-              <div className="la-flow-card" style={{ padding: 16 }}>
-                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, marginBottom: 12 }}>
-                  <div>
-                    <h4 style={{ margin: 0, color: "var(--heading)" }}>Response Aggregation Mapping</h4>
-                    <p style={{ margin: "4px 0 0", color: "var(--muted)", fontSize: 13 }}>
-                      Merge fields from multiple downstream responses into the final inbound response.
-                    </p>
-                  </div>
-                  <span className="la-section-badge la-section-badge--resp">AGGREGATION</span>
-                </div>
-                <MappingStudio
-                  sourceLabel="Downstream Response Fields"
-                  targetLabel="Inbound Response Fields"
-                  sourceAdapterName={outboundAdapterName}
-                  targetAdapterName={inboundAdapterName}
-                  sourceFields={outboundResponseFields}
-                  targetFields={inboundResponseFields}
-                  rows={responseRows}
-                  setRows={setResponseRows}
-                  isStrictProtocol={isStrictProtocolFormat(inboundConfig) || isStrictProtocolFormat(outboundConfig)}
-                  fees={availableFees}
-                />
-              </div>
-            </div>
-          )}
+          <MappingStudio
+            sourceLabel="Outbound Response Fields"
+            targetLabel={`${inboundAdapterName} Response Fields`}
+            sourceAdapterName={outboundAdapterName}
+            targetAdapterName={inboundAdapterName}
+            sourceFields={outboundResponseFieldGroups.flatMap((group) => group.fields)}
+            sourceGroups={outboundResponseFieldGroups}
+            targetFields={inboundResponseFields}
+            rows={responseRows}
+            setRows={setResponseRows}
+            isStrictProtocol={isStrictProtocolFormat(inboundConfig) || isStrictProtocolFormat(outboundConfig)}
+            fees={availableFees}
+            feesLoading={feesLoading}
+          />
         </div>
       </section>
-
-        <RouteFunctionsPanel
-          functions={routeFunctions}
-          setFunctions={setRouteFunctions}
-          availableFees={availableFees}
-        />
-
-
-
 
       {/* ── Save ──────────────────────────────────────────────────────── */}
       <div className="la-save-bar">

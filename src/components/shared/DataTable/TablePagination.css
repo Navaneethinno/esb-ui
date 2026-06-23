@@ -1,0 +1,103 @@
+.dt-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel);
+  box-shadow: var(--shadow-sm);
+  flex-wrap: wrap;
+}
+
+.dt-pagination-info {
+  min-width: 0;
+}
+
+.dt-pagination-range {
+  font-size: 12px;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.dt-pagination-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.dt-pagination-size {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.dt-pagination-size select {
+  min-width: 84px;
+  height: 32px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-soft);
+  color: var(--heading);
+  padding: 0 10px;
+  outline: none;
+}
+
+.dt-pagination-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-soft);
+  color: var(--heading);
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+.dt-pagination-button:hover:not(:disabled) {
+  background: rgba(22, 163, 74, 0.08);
+  border-color: rgba(22, 163, 74, 0.25);
+  color: var(--primary);
+}
+
+.dt-pagination-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.dt-pagination-page {
+  font-size: 12px;
+  color: var(--heading);
+  font-weight: 700;
+}
+
+@media (max-width: 767px) {
+  .dt-pagination {
+    padding: 10px 12px;
+  }
+
+  .dt-pagination-controls {
+    width: 100%;
+    justify-content: space-between;
+  }
+}
+
+html[data-theme="dark"] .dt-pagination {
+  background: var(--panel);
+}
+
+html[data-theme="dark"] .dt-pagination-size select,
+html[data-theme="dark"] .dt-pagination-button {
+  background: var(--panel-soft);
+}

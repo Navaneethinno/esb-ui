@@ -20,7 +20,7 @@ const rootBaseURL = (() => {
 
 const api = axios.create({
   baseURL,
-  timeout: APP_CONFIG.api.timeoutMs,
+  timeout: 15000, // Reduced from 30s to 15s
   headers: {
     "Content-Type": "application/json",
   },
@@ -28,7 +28,7 @@ const api = axios.create({
 
 const rootApi = axios.create({
   baseURL: rootBaseURL,
-  timeout: APP_CONFIG.api.timeoutMs,
+  timeout: 15000, // Reduced from 30s to 15s
   headers: {
     "Content-Type": "application/json",
   },
@@ -141,6 +141,25 @@ function unwrapList(data) {
   return data?.adapters || data?.fees || data?.data || data?.items || data?.results || [];
 }
 
+function normalizeFeeRecord(fee) {
+  if (!fee || typeof fee !== "object") {
+    return fee;
+  }
+
+  const normalizedFeeId = fee.feeId ?? fee.id ?? fee.fee_id ?? null;
+  const normalizedCreatedBy = fee.createdBy ?? fee.createdByUser ?? fee.created_by_user ?? fee.created_by ?? fee.username ?? null;
+  const normalizedUpdatedBy = fee.updatedBy ?? fee.updatedByUser ?? fee.updated_by_user ?? fee.updated_by ?? fee.username ?? null;
+  const normalizedCalculationType = fee.calculationType ?? fee.calcType ?? fee.feeType ?? fee.fee_type ?? null;
+
+  return {
+    ...fee,
+    ...(normalizedFeeId !== null ? { feeId: normalizedFeeId } : {}),
+    ...(normalizedCreatedBy !== null ? { createdBy: normalizedCreatedBy } : {}),
+    ...(normalizedUpdatedBy !== null ? { updatedBy: normalizedUpdatedBy } : {}),
+    ...(normalizedCalculationType !== null ? { calculationType: normalizedCalculationType, calcType: normalizedCalculationType } : {}),
+  };
+}
+
 function parseJsonString(data) {
   if (typeof data !== "string") {
     return data;
@@ -169,7 +188,7 @@ export async function listInboundAdapters(username) {
       onData: (data) => {
         result = Array.isArray(data) ? data : [];
       },
-      ttl: 30_000,
+      ttl: 5 * 60 * 1000, // 5 minutes
     },
   );
 
@@ -251,7 +270,7 @@ export async function listOutboundAdapters(username) {
       onData: (data) => {
         result = Array.isArray(data) ? data : [];
       },
-      ttl: 30_000,
+      ttl: 5 * 60 * 1000, // 5 minutes
     },
   );
 
@@ -340,7 +359,7 @@ export async function listLinkedAdapterConfigurations() {
       onData: (data) => {
         result = Array.isArray(data) ? data : [];
       },
-      ttl: 30_000,
+      ttl: 5 * 60 * 1000, // 5 minutes
     },
   );
 
@@ -370,7 +389,7 @@ export async function listUsers() {
       onData: (data) => {
         result = Array.isArray(data) ? data : [];
       },
-      ttl: 60_000,
+      ttl: 10 * 60 * 1000, // 10 minutes
     },
   );
 
@@ -412,7 +431,7 @@ export async function getRecentLogs(username) {
       onData: (data) => {
         result = Array.isArray(data) ? data : [];
       },
-      ttl: 15_000,
+      ttl: 2 * 60 * 1000, // 2 minutes
     },
   );
 
@@ -650,13 +669,13 @@ export async function listFees() {
     "fees",
     async () => {
       const response = await api.get("/fees");
-      return unwrapList(response.data);
+      return unwrapList(response.data).map(normalizeFeeRecord);
     },
     {
       onData: (data) => {
         result = Array.isArray(data) ? data : [];
       },
-      ttl: 30_000,
+      ttl: 5 * 60 * 1000, // 5 minutes
     },
   );
   return result;
@@ -670,13 +689,13 @@ export async function getFees(username) {
       const response = await api.get("/fees", {
         params: username ? { username } : undefined,
       });
-      return unwrapList(response.data);
+      return unwrapList(response.data).map(normalizeFeeRecord);
     },
     {
       onData: (data) => {
         result = Array.isArray(data) ? data : [];
       },
-      ttl: 30_000,
+      ttl: 5 * 60 * 1000, // 5 minutes
     },
   );
   return result;
@@ -684,7 +703,7 @@ export async function getFees(username) {
 
 export async function getFee(feeId) {
   const response = await api.get(`/fees/${feeId}`);
-  return response.data;
+  return normalizeFeeRecord(response.data);
 }
 
 export async function getFeeUsage(feeId) {

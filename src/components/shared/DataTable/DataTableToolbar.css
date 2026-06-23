@@ -1,16 +1,14 @@
 /**
- * ═══════════════════════════════════════════════════════════════
  * DataTableToolbar Styles - Mobile-First Responsive
- * ═══════════════════════════════════════════════════════════════
  */
 
 .dt-toolbar {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: clamp(12px, 2vw, 16px);
-  min-height: 64px;
-  padding: clamp(12px, 2vw, 14px) clamp(16px, 3vw, 20px);
+  gap: 12px;
+  min-height: 44px;
+  padding: 8px 10px;
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--panel);
@@ -23,8 +21,8 @@
   .dt-toolbar {
     flex-direction: column;
     align-items: stretch;
-    gap: 12px;
-    padding: 16px;
+    gap: 10px;
+    padding: 12px;
     min-height: auto;
   }
 }
@@ -34,7 +32,7 @@
   align-items: center;
   justify-content: center;
   gap: 6px;
-  height: 40px;
+  height: 36px;
   white-space: nowrap;
   flex-shrink: 0;
   border: 0;
@@ -67,11 +65,14 @@
 .dt-toolbar-controls {
   display: flex;
   align-items: center;
-  gap: clamp(8px, 1.5vw, 12px);
+  gap: 10px;
   min-width: 0;
   flex: 1;
   justify-content: flex-end;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
 }
 
 @media (max-width: 767px) {
@@ -85,8 +86,9 @@
 .dt-toolbar-filters {
   display: flex;
   align-items: center;
-  gap: clamp(8px, 1.5vw, 12px);
-  flex-wrap: wrap;
+  gap: 8px;
+  flex-wrap: nowrap;
+  min-width: max-content;
 }
 
 @media (max-width: 767px) {
@@ -100,7 +102,8 @@
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
+  min-width: max-content;
 }
 
 @media (max-width: 767px) {
@@ -111,7 +114,7 @@
 
 .dt-filter-tabs button {
   min-width: 76px;
-  height: 40px;
+  height: 36px;
   border: 1px solid var(--border);
   border-radius: 7px;
   padding: 0 14px;
@@ -147,7 +150,7 @@
 
 .dt-filter-select {
   width: clamp(140px, 20vw, 176px);
-  height: 40px;
+  height: 36px;
   padding: 0 12px;
   cursor: pointer;
   border: 1px solid var(--border);
@@ -170,9 +173,27 @@
   box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.12);
 }
 
-.dt-toolbar-search {
-  width: clamp(200px, 30vw, 280px);
-  height: 40px;
+.dt-toolbar-search-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1 1 480px;
+  min-width: 0;
+  justify-content: flex-end;
+  flex-wrap: nowrap;
+  min-width: max-content;
+}
+
+@media (max-width: 767px) {
+  .dt-toolbar-search-group {
+    width: 100%;
+    justify-content: flex-start;
+  }
+}
+
+.dt-toolbar-search-column {
+  width: clamp(130px, 14vw, 168px);
+  height: 36px;
   padding: 0 12px;
   border: 1px solid var(--border);
   border-radius: 7px;
@@ -183,10 +204,22 @@
   transition: border-color 0.15s, box-shadow 0.15s;
 }
 
-@media (max-width: 767px) {
-  .dt-toolbar-search {
-    width: 100%;
-  }
+.dt-toolbar-search-column:focus {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.12);
+}
+
+.dt-toolbar-search {
+  width: clamp(220px, 30vw, 360px);
+  height: 36px;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--heading);
+  background: var(--panel-soft);
+  font-size: clamp(12px, 1vw, 13px);
+  outline: none;
+  transition: border-color 0.15s, box-shadow 0.15s;
 }
 
 .dt-toolbar-search:focus {
@@ -194,12 +227,39 @@
   box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.12);
 }
 
+.dt-toolbar-search-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 36px;
+  white-space: nowrap;
+  padding: 0 14px;
+  border: 1px solid var(--primary);
+  border-radius: 7px;
+  color: #fff;
+  background: var(--primary);
+  font-size: clamp(12px, 1vw, 13px);
+  font-weight: 700;
+  cursor: pointer;
+  transition: background 0.15s, opacity 0.15s;
+}
+
+.dt-toolbar-search-btn:hover:not(:disabled) {
+  background: var(--primary-hover);
+}
+
+.dt-toolbar-search-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .dt-toolbar-refresh-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 8px;
-  height: 40px;
+  height: 36px;
   white-space: nowrap;
   padding: 0 14px;
   border: 1px solid var(--border);
@@ -216,6 +276,12 @@
   .dt-toolbar-refresh-btn {
     width: 100%;
   }
+
+  .dt-toolbar-search-column,
+  .dt-toolbar-search-btn,
+  .dt-toolbar-search {
+    width: 100%;
+  }
 }
 
 .dt-toolbar-refresh-btn:hover {
@@ -230,5 +296,36 @@
 
   .dt-toolbar-controls {
     flex-wrap: wrap;
+    overflow-x: visible;
   }
+
+  .dt-toolbar-filters,
+  .dt-toolbar-search-group {
+    flex-wrap: wrap;
+    min-width: 0;
+  }
+}
+
+@media (min-width: 1280px) {
+  .dt-toolbar {
+    flex-wrap: nowrap;
+  }
+
+  .dt-toolbar-controls {
+    min-width: 0;
+    flex-wrap: nowrap;
+  }
+
+  .dt-toolbar-filters {
+    flex-wrap: nowrap;
+  }
+
+  .dt-toolbar-search-group {
+    flex: 1 1 520px;
+    min-width: 0;
+  }
+}
+
+.dt-toolbar .dt-toolbar-controls > * {
+  flex-shrink: 0;
 }
